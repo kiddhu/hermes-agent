@@ -618,6 +618,44 @@ def test_complete_retry_with_corrected_created_cards_succeeds(worker_env):
     assert ok.get("ok") is True
 
 
+def test_complete_factory_gate_rejection_advertises_retry(worker_env):
+    """A factory-build terminal-write rejection must surface a structured
+    tool_error naming the stable code, the still-in-flight state, and the
+    retry path. Regression for AION-889 Phase B: the machine gate sits on the
+    complete chokepoint, and this tool_error is the worker's only signal.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET factory_build_gate = 1 WHERE id = ?",
+            (worker_env,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = kt._handle_complete({"summary": "done without a receipt"})
+    err = json.loads(out).get("error", "")
+    assert err, f"expected an error, got {out!r}"
+    assert "FACTORY_TERMINAL_RECEIPT_REQUIRED" in err
+    assert "factory_build_gate=1" in err
+    assert "still in-flight" in err
+    assert "Bind a valid receipt" in err
+
+    # The gate did not mutate state — the task is still running, so the
+    # worker can bind a receipt and retry.
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, worker_env)
+    finally:
+        conn.close()
+    assert t is not None
+    assert t.status == "running"
+
+
 def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     """Goal-mode tasks must pass the auxiliary judge before completion.
     Regression for #38367: workers bypassing the judge via early kanban_complete."""

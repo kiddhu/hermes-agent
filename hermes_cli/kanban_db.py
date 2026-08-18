@@ -2573,6 +2573,28 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "factory_build_gate" not in cols:
+        # Factory-build terminal-write hard gate (AION-889 Phase B). 1 = this
+        # task is a factory-build task and completion FAILS CLOSED unless a
+        # proof-kernel OUTCOME_ACCEPTED receipt sha256 is bound. 0 (default) =
+        # legacy/ordinary task; the complete path is byte-identical to before.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "factory_build_gate",
+            "factory_build_gate INTEGER NOT NULL DEFAULT 0",
+        )
+    if "factory_terminal_receipt_sha256" not in cols:
+        # 64-hex sha256 of the proof-kernel OUTCOME_ACCEPTED receipt bound to a
+        # factory-build task before its terminal write is allowed. NULL = not
+        # yet bound (legacy rows and pre-receipt factory tasks).
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "factory_terminal_receipt_sha256",
+            "factory_terminal_receipt_sha256 TEXT",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -5182,6 +5204,44 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+_RECEIPT_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _is_sha256_hex(value) -> bool:
+    """True iff ``value`` is a non-empty string of exactly 64 hex chars.
+
+    Shape-only check. It deliberately does NOT verify receipt *content*
+    (the C1-C10 / 8-field OUTCOME_ACCEPTED structure) — that stays a
+    single-set validation in the aion-governance proof kernel. This is the
+    minimal FAIL_CLOSED shape gate the terminal-write chokepoint enforces.
+    """
+    return isinstance(value, str) and bool(_RECEIPT_SHA256_HEX_RE.match(value))
+
+
+class FactoryTerminalReceiptRequiredError(ValueError):
+    """Raised by ``complete_task`` when a factory-build task (``factory_build_gate=1``)
+    attempts a terminal write without a bound 64-hex proof-kernel receipt.
+
+    This is a hard FAIL_CLOSED machine gate (AION-889 Phase B): the completion
+    is rejected with ZERO mutation and NO run/event change. Only the 64-hex
+    shape is enforced here; content-level receipt verification lives in the
+    aion-governance proof kernel (single-set logic — not re-implemented here).
+
+    ``code`` is a stable string for callers/tests/telemetry.
+    """
+
+    code = "FACTORY_TERMINAL_RECEIPT_REQUIRED"
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"complete_task FAIL_CLOSED: task {task_id} is factory-build "
+            f"(factory_build_gate=1) but has no bound 64-hex proof-kernel "
+            f"OUTCOME_ACCEPTED receipt (factory_terminal_receipt_sha256). "
+            f"Bind a valid receipt before completing."
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5221,6 +5281,25 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    # Hard machine gate (AION-889 Phase B): a factory-build task may not
+    # terminalize until a proof-kernel OUTCOME_ACCEPTED receipt sha256 is
+    # bound. FAIL_CLOSED with ZERO mutation and NO run/event change — this is
+    # a read-only pre-check raised before any terminal write. Content-level
+    # (C1-C10 / 8-field) verification stays in the aion-governance proof
+    # kernel; here we only enforce the 64-hex shape so the kernel remains
+    # the single set of validation logic.
+    _gate_row = conn.execute(
+        "SELECT factory_build_gate, factory_terminal_receipt_sha256 "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        _gate_row is not None
+        and _gate_row["factory_build_gate"] == 1
+        and not _is_sha256_hex(_gate_row["factory_terminal_receipt_sha256"])
+    ):
+        raise FactoryTerminalReceiptRequiredError(task_id)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a

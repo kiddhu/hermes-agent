@@ -700,6 +700,21 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
+            except kb.FactoryTerminalReceiptRequiredError as gate_err:
+                # Hard FAIL_CLOSED machine gate (AION-889 Phase B). The task
+                # was NOT mutated (read-only pre-check, no run/event change),
+                # so the worker can bind a receipt and retry. Surface the
+                # stable code + the actionable fix so this reads as a
+                # structured rejection, not a generic failure.
+                return tool_error(
+                    f"kanban_complete FAIL_CLOSED ({gate_err.code}): "
+                    f"task {gate_err.task_id} is factory-build "
+                    f"(factory_build_gate=1) but has no bound 64-hex "
+                    f"proof-kernel OUTCOME_ACCEPTED receipt "
+                    f"(factory_terminal_receipt_sha256). Your task is still "
+                    f"in-flight (no state change). Bind a valid receipt "
+                    f"before retrying kanban_complete."
+                )
             if not ok:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
