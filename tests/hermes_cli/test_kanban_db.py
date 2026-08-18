@@ -1260,19 +1260,25 @@ def _mark_factory_gate(conn, task_id: str, receipt_sha: str | None) -> None:
     conn.commit()
 
 
-def _bind_receipt(conn, task_id: str, doc: dict, uploaded_by: str | None) -> str:
-    """Serialize ``doc``, store it as a task attachment stamped with
-    ``uploaded_by``, mark gate=1 and bind its sha256. Returns the bound sha256.
+def _bind_receipt(conn, task_id: str, doc: dict, authenticated_actor: str | None) -> str:
+    """Serialize ``doc``, store it as a task attachment under the AUTHENTICATED
+    actor identity, mark gate=1 and bind its sha256. Returns the bound sha256.
 
-    REV2: the uploader identity is explicit. A legitimate proof-kernel receipt
-    is bound by the trusted kernel-executor identity; a worker binds with its
-    own identity (or None) and must fail the provenance check.
+    REV3: ``uploaded_by`` is no longer a caller parameter. The receipt's
+    provenance is the authenticated session profile (the runtime surface
+    established at process launch by the dispatcher/gateway). The test
+    authenticates the attach step by pinning ``kb._authenticated_actor``;
+    ``store_attachment_bytes`` ignores any caller ``uploaded_by`` and stamps the
+    authenticated actor. A legitimate proof-kernel receipt is bound under the
+    trusted kernel-executor identity; a worker binds under its own identity (or
+    None) and must fail the provenance check.
     """
     raw = json.dumps(doc, sort_keys=True).encode("utf-8")
     sha = _sha256(raw)
-    kb.store_attachment_bytes(
-        conn, task_id, "receipt.json", raw, uploaded_by=uploaded_by,
-    )
+    with unittest.mock.patch.object(
+        kb, "_authenticated_actor", return_value=authenticated_actor
+    ):
+        kb.store_attachment_bytes(conn, task_id, "receipt.json", raw)
     _mark_factory_gate(conn, task_id, sha)
     return sha
 
@@ -1357,23 +1363,57 @@ def test_complete_task_factory_gate_accepts_valid_receipt(kanban_home):
 
 
 def test_complete_task_factory_gate_rejects_worker_forged_receipt_provenance(kanban_home):
-    """Monarch F1 hostile proof #1: a worker/caller self-made fully-correct
-    OUTCOME_ACCEPTED JSON + attachment + digest still cannot DONE.
+    """Monarch F1 hostile proof #1 (REV3): a worker authenticated as its own
+    profile — never a trusted kernel-executor identity — cannot DONE, even with
+    a fully-correct OUTCOME_ACCEPTED JSON + attachment + matching digest.
 
-    The receipt is structurally perfect and its digest matches, but it was
-    attached by the WORKER's own identity (or the agent-toolset "agent"
-    stamp, or no identity at all) — never a trusted kernel-executor identity —
-    so completion is FAIL_CLOSED.
+    The receipt's provenance is the AUTHENTICATED ACTOR (the runtime profile),
+    not a caller-supplied ``uploaded_by``. A worker binds under its own identity
+    (or no identity at all), so completion is FAIL_CLOSED.
     """
     with kb.connect() as conn:
-        for forged_uploader in (None, "agent", "agent007", "worker"):
+        for forged_actor in (None, "agent", "agent007", "worker"):
             t = kb.create_task(conn, title="factory task")
             _set_running_run(conn, t, run_id=4242)
             _bind_receipt(
                 conn, t,
                 _receipt_doc(t, run_id="4242", binding_value="4242"),
-                uploaded_by=forged_uploader,
+                forged_actor,
             )
+            with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
+                kb.complete_task(conn, t, result="done")
+            assert kb.get_task(conn, t).status != "done"
+
+
+def test_attachment_uploaded_by_overrides_caller_forged_kernel_identity(kanban_home):
+    """Monarch F1 hostile proof #2 (REV3, H1): a hostile caller who imports
+    ``kanban_db`` and calls the public attachment mutation API with a forged
+    ``uploaded_by=aion_monarch_proof_kernel`` does NOT persist that value.
+
+    ``store_attachment_bytes`` / ``add_attachment`` ignore the caller parameter
+    and stamp the authenticated actor instead, so the forged trusted-kernel
+    identity is overwritten and a fully-correct fake receipt bound this way
+    still FAIL_CLOSED. This is the machine evidence (H3) that an ordinary
+    caller cannot obtain the trusted write capability via the parameter.
+    """
+    with kb.connect() as conn:
+        # Authenticated as a non-kernel worker profile (the ordinary caller).
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="agent007"):
+            t = kb.create_task(conn, title="factory task")
+            _set_running_run(conn, t, run_id=4242)
+            doc = _receipt_doc(t, run_id="4242", binding_value="4242")
+            raw = json.dumps(doc, sort_keys=True).encode("utf-8")
+            sha = _sha256(raw)
+            # Forge the trusted-kernel uploader identity via the caller param.
+            kb.store_attachment_bytes(
+                conn, t, "receipt.json", raw,
+                uploaded_by=_TRUSTED_KERNEL_UPLOADER,
+            )
+            # The persisted provenance is the authenticated actor, NOT the forged value.
+            atts = kb.list_attachments(conn, t)
+            assert atts and atts[0].uploaded_by == "agent007"
+            assert atts[0].uploaded_by != _TRUSTED_KERNEL_UPLOADER
+            _mark_factory_gate(conn, t, sha)
             with pytest.raises(kb.FactoryTerminalReceiptRequiredError):
                 kb.complete_task(conn, t, result="done")
             assert kb.get_task(conn, t).status != "done"
@@ -1472,22 +1512,28 @@ def test_create_task_forces_gate_on_directive_fields_even_explicit_zero(kanban_h
 
 
 def test_create_task_auto_gate_on_agent_profile_aion_title(kanban_home):
-    """factory-profile create with an AION_ title -> auto gate=1 (b2)."""
+    """REV3: a factory profile authenticated as the creator yields gate=1 (b2);
+    the caller-supplied ``created_by`` is ignored/overridden."""
     with kb.connect() as conn:
-        t = kb.create_task(
-            conn, title="AION_889_phase_b", created_by="agent007",
-        )
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="agent007"):
+            t = kb.create_task(conn, title="AION_889_phase_b", created_by=None)
         row = conn.execute(
-            "SELECT factory_build_gate FROM tasks WHERE id = ?", (t,),
+            "SELECT factory_build_gate, created_by FROM tasks WHERE id = ?", (t,),
         ).fetchone()
         assert row["factory_build_gate"] == 1
+        # Caller param is overridden by the authenticated actor, not persisted.
+        assert row["created_by"] == "agent007"
 
-        # Non-factory profile + non-AION title + no directive fields -> gate=0.
-        t2 = kb.create_task(conn, title="ordinary", created_by="someone-else")
+        # Non-factory authenticated creator + non-AION title + no directive
+        # fields -> gate=0. Even a forged factory ``created_by`` caller value is
+        # ignored: the persisted identity is the authenticated actor.
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="someone-else"):
+            t2 = kb.create_task(conn, title="ordinary", created_by="agent007")
         row2 = conn.execute(
-            "SELECT factory_build_gate FROM tasks WHERE id = ?", (t2,),
+            "SELECT factory_build_gate, created_by FROM tasks WHERE id = ?", (t2,),
         ).fetchone()
         assert row2["factory_build_gate"] == 0
+        assert row2["created_by"] == "someone-else"
 
 
 def test_create_task_forces_gate_on_strategic_directive_body(kanban_home):
@@ -1503,23 +1549,28 @@ def test_create_task_forces_gate_on_strategic_directive_body(kanban_home):
 
 
 def test_create_task_factory_profile_total_gate_entry_zero_markers(kanban_home):
-    """Monarch F2 hostile proof #2: an official factory-build admission (a
-    factory profile creating a task) omitting ALL optional prose/title markers
+    """Monarch F2 hostile proof #2 (REV3): an official factory-build admission
+    (a factory profile creating a task) omitting ALL optional prose/title markers
     still yields gate=1 — omission of every optional marker can never yield
     gate=0. Gate entry is TOTAL on the authenticated creator identity.
     """
     with kb.connect() as conn:
         for profile in sorted(kb.FACTORY_PROFILES):
-            t = kb.create_task(conn, title="no markers", created_by=profile)
+            with unittest.mock.patch.object(
+                kb, "_authenticated_actor", return_value=profile
+            ):
+                t = kb.create_task(conn, title="no markers", created_by=None)
             row = conn.execute(
-                "SELECT factory_build_gate FROM tasks WHERE id = ?", (t,),
+                "SELECT factory_build_gate, created_by FROM tasks WHERE id = ?", (t,),
             ).fetchone()
             assert row["factory_build_gate"] == 1, (
                 f"factory profile {profile!r} with zero markers must gate=1"
             )
+            assert row["created_by"] == profile
 
         # A non-factory creator with zero markers stays gate=0 (no false positive).
-        t2 = kb.create_task(conn, title="no markers", created_by="someone-else")
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="someone-else"):
+            t2 = kb.create_task(conn, title="no markers", created_by=None)
         row2 = conn.execute(
             "SELECT factory_build_gate FROM tasks WHERE id = ?", (t2,),
         ).fetchone()
@@ -1527,15 +1578,38 @@ def test_create_task_factory_profile_total_gate_entry_zero_markers(kanban_home):
 
 
 def test_create_task_factory_profile_forces_gate_over_explicit_zero(kanban_home):
-    """REV2 b3: a factory profile's explicit gate=0 is overridden to 1."""
+    """REV3 b3: a factory profile's explicit gate=0 is overridden to 1."""
     with kb.connect() as conn:
-        t = kb.create_task(
-            conn, title="no markers", created_by="gm2", factory_build_gate=0,
-        )
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="gm2"):
+            t = kb.create_task(
+                conn, title="no markers", created_by="someone-else", factory_build_gate=0,
+            )
         row = conn.execute(
-            "SELECT factory_build_gate FROM tasks WHERE id = ?", (t,),
+            "SELECT factory_build_gate, created_by FROM tasks WHERE id = ?", (t,),
         ).fetchone()
         assert row["factory_build_gate"] == 1
+        assert row["created_by"] == "gm2"
+
+
+def test_create_task_direct_mutation_created_by_ignored_factory_authenticated(kanban_home):
+    """Monarch F2 hostile proof (REV3, H2): a factory worker calling the public
+    core function with ``created_by=None`` or a non-factory identity still lands
+    gate=1 — the caller parameter is ignored and the authoritative identity is
+    the authenticated actor (the runtime profile). This is the machine evidence
+    (H3) that an ordinary caller cannot dodge the gate via the parameter.
+    """
+    with kb.connect() as conn:
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="agent007"):
+            # Dodge attempt 1: created_by=None.
+            t1 = kb.create_task(conn, title="x", created_by=None)
+            # Dodge attempt 2: created_by=non-factory identity.
+            t2 = kb.create_task(conn, title="x", created_by="someone-else")
+        for tid in (t1, t2):
+            row = conn.execute(
+                "SELECT factory_build_gate, created_by FROM tasks WHERE id = ?", (tid,),
+            ).fetchone()
+            assert row["factory_build_gate"] == 1
+            assert row["created_by"] == "agent007"
 
 
 def test_factory_build_gate_immutable_one_to_zero_rejected(kanban_home):

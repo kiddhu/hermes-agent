@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import unittest.mock
 from pathlib import Path
 
 import pytest
@@ -78,15 +79,16 @@ def test_add_list_get_delete_attachment(kanban_home, tmp_path):
         blob = dest_dir / "source.pdf"
         blob.write_bytes(b"%PDF-1.4 fake")
 
-        att_id = kb.add_attachment(
-            conn,
-            task_id,
-            filename="source.pdf",
-            stored_path=str(blob),
-            content_type="application/pdf",
-            size=blob.stat().st_size,
-            uploaded_by="tester",
-        )
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="tester"):
+            att_id = kb.add_attachment(
+                conn,
+                task_id,
+                filename="source.pdf",
+                stored_path=str(blob),
+                content_type="application/pdf",
+                size=blob.stat().st_size,
+                uploaded_by="tester",
+            )
         assert att_id > 0
 
         atts = kb.list_attachments(conn, task_id)
@@ -300,10 +302,11 @@ def test_store_attachment_bytes_roundtrip(kanban_home):
     conn = kb.connect()
     try:
         task_id = _make_task(conn)
-        att_id = kb.store_attachment_bytes(
-            conn, task_id, "doc.txt", b"some bytes",
-            content_type="text/plain", uploaded_by="tester",
-        )
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="tester"):
+            att_id = kb.store_attachment_bytes(
+                conn, task_id, "doc.txt", b"some bytes",
+                content_type="text/plain", uploaded_by="tester",
+            )
         a = kb.get_attachment(conn, att_id)
         assert a is not None
         assert a.filename == "doc.txt"

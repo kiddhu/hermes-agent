@@ -955,7 +955,6 @@ def _handle_attach(args: dict, **kw) -> str:
                 str(filename),
                 data,
                 content_type=content_type,
-                uploaded_by="agent",
                 board=board,
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))
@@ -1082,7 +1081,6 @@ def _handle_attach_url(args: dict, **kw) -> str:
                 str(filename),
                 data,
                 content_type=content_type or fetched_ct,
-                uploaded_by="agent",
                 board=board,
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))
@@ -1255,7 +1253,6 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)

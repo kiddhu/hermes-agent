@@ -2687,7 +2687,7 @@ def test_attach_roundtrips_bytes_to_row_and_disk(worker_env):
         a = atts[0]
         assert a.id == att_id
         assert a.content_type == "text/plain"
-        assert a.uploaded_by == "agent"
+        assert a.uploaded_by == "test-worker"
         # Blob is on disk under the task's attachments dir with the bytes.
         assert Path(a.stored_path).read_bytes() == content
         assert Path(a.stored_path).resolve().is_relative_to(

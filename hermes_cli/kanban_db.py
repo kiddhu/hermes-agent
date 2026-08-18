@@ -140,13 +140,23 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-# AION-889 Phase B REV2 — factory-build receipt authenticity (provenance-bound)
-# + TOTAL deterministic gate entry. The receipt guard in ``complete_task`` is a
-# READBACK-ONLY consumer of the proof kernel's OUTCOME_ACCEPTED receipt: it
-# never re-computes C1..C10 (the aion-governance proof kernel is the single
-# semantic authority). REV2 binds the receipt to an unforgeable provenance
-# surface (the task attachment ``uploaded_by`` identity) and makes gate entry
-# total on the authenticated creator identity.
+# AION-889 Phase B REV3 — caller-unforgeable provenance identity binding.
+# REV1 added the receipt authenticity gate + deterministic gate entry. REV2
+# bound the receipt to the task attachment ``uploaded_by`` identity and made
+# gate entry TOTAL on the creator identity — but REV2 still accepted
+# ``uploaded_by`` / ``created_by`` as CALLER PARAMETERS and persisted them
+# directly (Monarch finding: PROVENANCE_IDENTITIES_STILL_CALLER_FILLABLE).
+#
+# REV3 binds both identity fields to the single authenticated-actor surface a
+# caller parameter cannot override: the process's authenticated profile,
+# established at process launch by the dispatcher / gateway
+# (``HERMES_PROFILE`` / ``HERMES_PROFILE_NAME`` env, falling back to the active
+# profile inferred from ``HERMES_HOME``). ``_authenticated_actor()`` is the one
+# resolver; ``create_task`` and ``add_attachment`` ignore caller-supplied
+# ``created_by`` / ``uploaded_by`` and stamp the resolved actor instead. The
+# receipt guard in ``complete_task`` remains a READBACK-ONLY consumer of the
+# proof kernel's OUTCOME_ACCEPTED receipt — it never re-computes C1..C10 (the
+# aion-governance proof kernel is the single semantic authority).
 # ---------------------------------------------------------------------------
 
 # The receipt JSON ``schema`` value the guard accepts (closed shape).
@@ -194,13 +204,16 @@ FACTORY_SEMANTIC_FIELDS = (
 # prose/title marker can never yield gate=0 for an official factory admission.
 FACTORY_PROFILES = frozenset({"agent007", "gm2", "merger", "bafuxunan", "elder-senate"})
 
-# REV2 — trusted kernel-executor uploader identity(ies). A proof-kernel
+# REV3 — trusted kernel-executor uploader identity(ies). A proof-kernel
 # OUTCOME_ACCEPTED receipt is only accepted when bound as a task attachment
-# whose ``uploaded_by`` is one of these trusted kernel-executor identities. The
-# completing worker/caller attaches files through the agent toolset
-# (``kanban_attach`` / ``kanban_attach_url``), which stamps a fixed
-# ``uploaded_by="agent"`` label — never one of these kernel identities — so a
-# worker cannot forge the receipt's provenance (the Monarch F1 hostile proof).
+# whose ``uploaded_by`` is one of these trusted kernel-executor identities.
+# ``uploaded_by`` is NO LONGER a caller parameter: ``add_attachment`` /
+# ``store_attachment_bytes`` stamp ``_authenticated_actor()`` — the process's
+# authenticated profile (established at launch by the dispatcher/gateway).
+# A completing worker runs under its own profile (``agent007``, etc.), never a
+# kernel identity, so a worker cannot forge the receipt's provenance even by
+# importing ``kanban_db`` and passing ``uploaded_by=...`` directly (the Monarch
+# F1 hostile proof).
 FACTORY_TRUSTED_RECEIPT_UPLOADERS = frozenset({
     "aion_monarch_proof_kernel",  # aion-governance KERNEL_NAME (frozen v1.3.0)
 })
@@ -224,6 +237,43 @@ FACTORY_ACTOR_ROLES = frozenset({
     "auditor",
     "merger_or_closer",
 })
+
+
+def _authenticated_actor() -> str:
+    """Resolve the authenticated actor identity for provenance stamping.
+
+    This is the single machine surface a caller parameter cannot override: the
+    actor identity is the process's **authenticated profile**, established at
+    process launch by the dispatcher / gateway — never a value the ordinary
+    caller passes in. Resolution order (all server-side):
+
+    1. ``HERMES_PROFILE_NAME`` / ``HERMES_PROFILE`` — exported by the dispatcher
+       and the messaging gateway when they spawn a worker / agent turn.
+    2. The active Hermes profile inferred from ``HERMES_HOME``
+       (``get_active_profile_name()``) — the same surface the tool-dispatch
+       path already uses to derive the ``kanban_comment`` author and the
+       ``kanban_create`` ``created_by`` hint.
+    3. ``"worker"`` as a final non-factory, non-kernel fallback.
+
+    ``create_task`` and ``add_attachment`` call this and **ignore** any
+    caller-supplied ``created_by`` / ``uploaded_by`` value, so a hostile caller
+    who imports ``kanban_db`` and passes ``created_by=<factory profile>`` or
+    ``uploaded_by=aion_monarch_proof_kernel`` cannot forge provenance: the
+    persisted identity is the runtime profile, not the caller string.
+    """
+    for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = (os.environ.get(env_name) or "").strip()
+        if value:
+            return value
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        name = (get_active_profile_name() or "").strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    return "worker"
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -3180,6 +3230,14 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    # AION-889 Phase B REV3 — the creator identity is NOT caller-fillable.
+    # ``created_by`` is overridden by the authenticated actor (the process's
+    # profile, established at launch by the dispatcher/gateway) BEFORE the
+    # factory-gate derivation and the ``tasks.created_by`` write. A hostile
+    # caller importing ``kanban_db`` and passing ``created_by=<factory profile>``
+    # or ``created_by=None`` cannot dodge/force the gate: the derived value is
+    # the runtime profile, never the caller string.
+    created_by = _authenticated_actor()
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3953,6 +4011,10 @@ def store_attachment_bytes(
     or :class:`ValueError` for a bad filename / unknown task. On any failure
     after the blob is written (e.g. the task disappeared) the orphaned blob
     is removed before re-raising.
+
+    AION-889 Phase B REV3: ``uploaded_by`` is NOT caller-fillable. The value
+    passed here is ignored — :func:`add_attachment` stamps the authenticated
+    actor (``_authenticated_actor()``) instead.
     """
     if max_bytes is None:
         max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
@@ -4000,7 +4062,17 @@ def add_attachment(
     The caller is responsible for writing the blob to ``stored_path``
     first (under :func:`task_attachments_dir`); this only persists the
     metadata row and appends an ``attached`` event.
+
+    AION-889 Phase B REV3: ``uploaded_by`` is NOT caller-fillable. Any
+    caller-supplied value is ignored — the persisted provenance is the
+    authenticated actor (``_authenticated_actor()``), the process's profile
+    established at launch by the dispatcher/gateway. A hostile caller cannot
+    forge a trusted kernel-executor uploader identity by passing
+    ``uploaded_by=aion_monarch_proof_kernel``.
     """
+    # Override the caller-supplied value with the authenticated actor before it
+    # is persisted or emitted in the ``attached`` event.
+    uploaded_by = _authenticated_actor()
     if not filename or not filename.strip():
         raise ValueError("attachment filename is required")
     if not stored_path or not stored_path.strip():

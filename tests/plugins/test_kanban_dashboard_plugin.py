@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import time
+import unittest.mock
 from pathlib import Path
 
 import pytest
@@ -1954,7 +1955,8 @@ def test_board_warnings_cleared_after_clean_completion(client):
     conn = kb.connect()
     try:
         parent = kb.create_task(conn, title="parent", assignee="alice")
-        real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="alice"):
+            real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
 
         import pytest as _pytest
         with _pytest.raises(kb.HallucinatedCardsError):

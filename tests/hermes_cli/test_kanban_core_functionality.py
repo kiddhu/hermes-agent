@@ -16,6 +16,7 @@ import os
 import subprocess
 import threading
 import time
+import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3887,8 +3888,9 @@ def test_complete_with_created_cards_all_verified_records_manifest(kanban_home):
     conn = kb.connect()
     try:
         parent = kb.create_task(conn, title="parent", assignee="alice")
-        c1 = kb.create_task(conn, title="c1", assignee="x", created_by="alice")
-        c2 = kb.create_task(conn, title="c2", assignee="y", created_by="alice")
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="alice"):
+            c1 = kb.create_task(conn, title="c1", assignee="x", created_by="alice")
+            c2 = kb.create_task(conn, title="c2", assignee="y", created_by="alice")
         ok = kb.complete_task(
             conn, parent,
             summary="done, created c1+c2",
@@ -3915,7 +3917,8 @@ def test_complete_with_phantom_created_cards_raises_and_audits(kanban_home):
     conn = kb.connect()
     try:
         parent = kb.create_task(conn, title="parent", assignee="alice")
-        real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="alice"):
+            real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
         phantom_id = "t_deadbeefcafe"
 
         with pytest.raises(kb.HallucinatedCardsError) as excinfo:
@@ -4019,9 +4022,10 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
         kb.claim_task(conn, parent_a)
         parent_b = kb.create_task(conn, title="retry-corrected", assignee="alice")
         kb.claim_task(conn, parent_b)
-        real = kb.create_task(
-            conn, title="real-child", assignee="x", created_by="alice",
-        )
+        with unittest.mock.patch.object(kb, "_authenticated_actor", return_value="alice"):
+            real = kb.create_task(
+                conn, title="real-child", assignee="x", created_by="alice",
+            )
 
         # First attempt: phantom in the list rejects, task stays running.
         with pytest.raises(kb.HallucinatedCardsError):

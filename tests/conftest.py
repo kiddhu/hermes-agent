@@ -191,6 +191,13 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_INFERENCE_MODEL",
     "HERMES_INFERENCE_PROVIDER",
     "HERMES_TUI_PROVIDER",
+    # The active profile identity leaks from a developer shell / dispatched
+    # worker and changes the DB-layer authenticated-actor derivation
+    # (kanban_db._authenticated_actor) and the kanban tool author defaults.
+    # Blank both so tests are deterministic and a leaked ``agent007`` (or any
+    # factory profile) can't force ``factory_build_gate=1`` for ordinary tasks.
+    "HERMES_PROFILE",
+    "HERMES_PROFILE_NAME",
     "HERMES_MANAGED",
     "HERMES_MANAGED_DIR",
     "HERMES_DEV",
