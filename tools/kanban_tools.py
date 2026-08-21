@@ -77,7 +77,8 @@ def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
     A delegate_task child runs in the same process as its parent, so stale or
     inherited HERMES_KANBAN_* env vars are not proof of dispatcher ownership.
     The child may summarize findings to its parent, but it must not complete,
-    block, heartbeat, comment, create, link, or unblock board tasks directly.
+    block, heartbeat, comment, create, link, unblock, or archive board tasks
+    directly.
     """
     if not _is_delegated_child_context():
         return None
@@ -1433,6 +1434,67 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_archive(args: dict, **kw) -> str:
+    """Durably archive a superseded task through the Native kernel."""
+    delegated_err = _reject_delegated_child_mutation("kanban_archive")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_archive")
+    if guard:
+        return guard
+    tid = str(args.get("task_id") or "").strip()
+    reason = str(args.get("reason") or "").strip()
+    if not tid:
+        return tool_error("task_id is required")
+    if not reason:
+        return tool_error("reason is required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+            if task.status == "archived":
+                return _ok(
+                    task_id=tid,
+                    status="archived",
+                    already_archived=True,
+                )
+            actor = os.environ.get("HERMES_PROFILE") or "kanban-orchestrator"
+            ok = kb.archive_task(
+                conn,
+                tid,
+                reason=reason,
+                actor=actor,
+                source="kanban_archive",
+            )
+            if not ok:
+                # A concurrent identical replay may have won after our read.
+                # Treat the observed terminal state as success, but never mask a
+                # genuinely failed transition to some other state.
+                current = kb.get_task(conn, tid)
+                if current is not None and current.status == "archived":
+                    return _ok(
+                        task_id=tid,
+                        status="archived",
+                        already_archived=True,
+                    )
+                return tool_error(f"could not archive {tid}")
+            return _ok(
+                task_id=tid,
+                status="archived",
+                already_archived=False,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_archive: {e}")
+    except Exception as e:
+        logger.exception("kanban_archive failed")
+        return tool_error(f"kanban_archive: {e}")
+
+
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
     delegated_err = _reject_delegated_child_mutation("kanban_link")
@@ -2045,6 +2107,33 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_ARCHIVE_SCHEMA = {
+    "name": "kanban_archive",
+    "description": (
+        "Durably archive a superseded task so it cannot be dispatched again. "
+        "Archival uses Native terminal semantics: dependency links and history "
+        "are preserved, downstream children may promote, and a reasoned audit "
+        "event is recorded. Replaying the same request is idempotent. "
+        "Orchestrator-only — dispatcher-spawned task workers never see this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Superseded task id to archive.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why this task is superseded and safe to archive.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "reason"],
+    },
+}
+
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -2084,6 +2173,15 @@ registry.register(
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="kanban_archive",
+    toolset="kanban",
+    schema=KANBAN_ARCHIVE_SCHEMA,
+    handler=_handle_archive,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🗄",
 )
 
 registry.register(

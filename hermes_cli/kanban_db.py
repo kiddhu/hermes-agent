@@ -8338,7 +8338,20 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    actor: Optional[str] = None,
+    source: Optional[str] = None,
+) -> bool:
+    """Move a task to durable, non-dispatchable ``archived`` terminality.
+
+    ``reason`` / ``actor`` / ``source`` are optional audit context for public
+    controller operations. Existing CLI and dashboard callers retain the
+    legacy empty payload when they omit all three fields.
+    """
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -8367,7 +8380,18 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             outcome="reclaimed",
             summary="invariant recovery on archive",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        audit_payload = {
+            key: value
+            for key, value in (
+                ("reason", reason),
+                ("actor", actor),
+                ("source", source),
+            )
+            if value
+        }
+        _append_event(
+            conn, task_id, "archived", audit_payload or None, run_id=run_id,
+        )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
