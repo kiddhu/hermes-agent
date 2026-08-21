@@ -8345,14 +8345,49 @@ def archive_task(
     reason: Optional[str] = None,
     actor: Optional[str] = None,
     source: Optional[str] = None,
+    fail_if_active_run: bool = False,
 ) -> bool:
     """Move a task to durable, non-dispatchable ``archived`` terminality.
 
     ``reason`` / ``actor`` / ``source`` are optional audit context for public
     controller operations. Existing CLI and dashboard callers retain the
     legacy empty payload when they omit all three fields.
+
+    Model-facing controller operations set ``fail_if_active_run``.  In that
+    mode the active-obligation check and archive transition share one write
+    transaction, so a dispatcher claim cannot race between a preflight read
+    and the destructive transition.  Human CLI/dashboard recovery keeps the
+    legacy ability to reclaim a live run by leaving the flag false.
     """
     with write_txn(conn):
+        if fail_if_active_run:
+            active = conn.execute(
+                "SELECT t.status, t.current_run_id, t.claim_lock, t.worker_pid, "
+                "       EXISTS ("
+                "           SELECT 1 FROM task_runs r "
+                "           WHERE r.task_id = t.id AND r.ended_at IS NULL"
+                "       ) AS has_open_run "
+                "FROM tasks t WHERE t.id = ?",
+                (task_id,),
+            ).fetchone()
+            if active is None:
+                return False
+            active_fields = []
+            if active["status"] == "running":
+                active_fields.append("status=running")
+            if active["current_run_id"] is not None:
+                active_fields.append(f"current_run_id={active['current_run_id']}")
+            if active["claim_lock"] is not None:
+                active_fields.append("claim_lock=set")
+            if active["worker_pid"] is not None:
+                active_fields.append(f"worker_pid={active['worker_pid']}")
+            if active["has_open_run"]:
+                active_fields.append("open_run=set")
+            if active_fields:
+                raise RuntimeError(
+                    f"refusing to archive active task {task_id}: "
+                    + ", ".join(active_fields)
+                )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "

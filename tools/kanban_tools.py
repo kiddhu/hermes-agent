@@ -1468,6 +1468,7 @@ def _handle_archive(args: dict, **kw) -> str:
                 reason=reason,
                 actor=actor,
                 source="kanban_archive",
+                fail_if_active_run=True,
             )
             if not ok:
                 # A concurrent identical replay may have won after our read.
@@ -1488,7 +1489,7 @@ def _handle_archive(args: dict, **kw) -> str:
             )
         finally:
             conn.close()
-    except ValueError as e:
+    except (ValueError, RuntimeError) as e:
         return tool_error(f"kanban_archive: {e}")
     except Exception as e:
         logger.exception("kanban_archive failed")
@@ -2113,7 +2114,8 @@ KANBAN_ARCHIVE_SCHEMA = {
         "Durably archive a superseded task so it cannot be dispatched again. "
         "Archival uses Native terminal semantics: dependency links and history "
         "are preserved, downstream children may promote, and a reasoned audit "
-        "event is recorded. Replaying the same request is idempotent. "
+        "event is recorded. Tasks with a live claim or open run fail closed; "
+        "replaying the same request is idempotent. "
         "Orchestrator-only — dispatcher-spawned task workers never see this tool."
     ),
     "parameters": {

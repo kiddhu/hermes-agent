@@ -115,6 +115,70 @@ def test_archive_requires_reason_and_rejects_unknown_task(orchestrator_env):
     assert "not found" in unknown["error"]
 
 
+def test_archive_running_task_fails_closed_without_reclaim_or_promotion(
+    orchestrator_env,
+):
+    kb = orchestrator_env
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="actively running superseded candidate")
+        downstream = kb.create_task(
+            conn, title="must remain gated", parents=[task_id],
+        )
+        claim = kb.claim_task(conn, task_id)
+        assert claim is not None
+        before = kb.get_task(conn, task_id)
+        run_id = before.current_run_id
+        assert before.status == "running"
+        assert run_id is not None
+
+    from tools import kanban_tools as kt
+
+    refused = json.loads(
+        kt._handle_archive({"task_id": task_id, "reason": "superseded"})
+    )
+    assert "refusing to archive active task" in refused["error"]
+    assert "status=running" in refused["error"]
+
+    with kb.connect() as conn:
+        after = kb.get_task(conn, task_id)
+        assert after.status == "running"
+        assert after.current_run_id == run_id
+        assert after.claim_lock == before.claim_lock
+        assert kb.get_task(conn, downstream).status == "todo"
+        run = kb.get_run(conn, run_id)
+        assert run.status == "running"
+        assert run.ended_at is None
+        assert not [e for e in kb.list_events(conn, task_id) if e.kind == "archived"]
+
+
+def test_archive_fails_closed_on_detached_open_run(orchestrator_env):
+    """An inconsistent task row must not bypass an open run obligation."""
+    kb = orchestrator_env
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="detached active run")
+        assert kb.claim_task(conn, task_id) is not None
+        run_id = kb.get_task(conn, task_id).current_run_id
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+            (task_id,),
+        )
+
+    from tools import kanban_tools as kt
+
+    refused = json.loads(
+        kt._handle_archive({"task_id": task_id, "reason": "superseded"})
+    )
+    assert "open_run=set" in refused["error"]
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"
+        run = kb.get_run(conn, run_id)
+        assert run.status == "running"
+        assert run.ended_at is None
+        assert not [e for e in kb.list_events(conn, task_id) if e.kind == "archived"]
+
+
 def test_archive_is_orchestrator_only_even_if_handler_is_called_stale(
     orchestrator_env, monkeypatch,
 ):
