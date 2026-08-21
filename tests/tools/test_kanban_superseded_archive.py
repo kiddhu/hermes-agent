@@ -179,6 +179,25 @@ def test_archive_fails_closed_on_detached_open_run(orchestrator_env):
         assert not [e for e in kb.list_events(conn, task_id) if e.kind == "archived"]
 
 
+@pytest.mark.parametrize("status", ["ready", "fenced", "blocked", "done"])
+def test_archive_fails_closed_on_expected_status_drift(orchestrator_env, status):
+    kb = orchestrator_env
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"unexpected {status} candidate")
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+
+    from tools import kanban_tools as kt
+
+    refused = json.loads(
+        kt._handle_archive({"task_id": task_id, "reason": "superseded"})
+    )
+    assert f"expected status todo, found {status}" in refused["error"]
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == status
+        assert not [e for e in kb.list_events(conn, task_id) if e.kind == "archived"]
+
+
 def test_archive_is_orchestrator_only_even_if_handler_is_called_stale(
     orchestrator_env, monkeypatch,
 ):

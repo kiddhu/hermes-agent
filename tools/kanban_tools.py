@@ -1469,6 +1469,7 @@ def _handle_archive(args: dict, **kw) -> str:
                 actor=actor,
                 source="kanban_archive",
                 fail_if_active_run=True,
+                expected_status="todo",
             )
             if not ok:
                 # A concurrent identical replay may have won after our read.
@@ -2114,8 +2115,9 @@ KANBAN_ARCHIVE_SCHEMA = {
         "Durably archive a superseded task so it cannot be dispatched again. "
         "Archival uses Native terminal semantics: dependency links and history "
         "are preserved, downstream children may promote, and a reasoned audit "
-        "event is recorded. Tasks with a live claim or open run fail closed; "
-        "replaying the same request is idempotent. "
+        "event is recorded. Only an exact todo-state candidate is accepted; "
+        "status drift, a live claim, or an open run fails closed. Replaying an "
+        "already archived request is idempotent. "
         "Orchestrator-only — dispatcher-spawned task workers never see this tool."
     ),
     "parameters": {

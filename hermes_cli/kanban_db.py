@@ -8346,6 +8346,7 @@ def archive_task(
     actor: Optional[str] = None,
     source: Optional[str] = None,
     fail_if_active_run: bool = False,
+    expected_status: Optional[str] = None,
 ) -> bool:
     """Move a task to durable, non-dispatchable ``archived`` terminality.
 
@@ -8353,11 +8354,12 @@ def archive_task(
     controller operations. Existing CLI and dashboard callers retain the
     legacy empty payload when they omit all three fields.
 
-    Model-facing controller operations set ``fail_if_active_run``.  In that
-    mode the active-obligation check and archive transition share one write
-    transaction, so a dispatcher claim cannot race between a preflight read
-    and the destructive transition.  Human CLI/dashboard recovery keeps the
-    legacy ability to reclaim a live run by leaving the flag false.
+    Model-facing controller operations set ``fail_if_active_run`` and an
+    ``expected_status``.  In that mode the expected-state/active-obligation
+    checks and archive transition share one write transaction, so a dispatcher
+    claim or lifecycle transition cannot race between a preflight read and the
+    destructive transition.  Human CLI/dashboard recovery keeps the legacy
+    ability to archive other states and reclaim a live run by omitting them.
     """
     with write_txn(conn):
         if fail_if_active_run:
@@ -8387,6 +8389,11 @@ def archive_task(
                 raise RuntimeError(
                     f"refusing to archive active task {task_id}: "
                     + ", ".join(active_fields)
+                )
+            if expected_status is not None and active["status"] != expected_status:
+                raise RuntimeError(
+                    f"refusing to archive task {task_id}: expected status "
+                    f"{expected_status}, found {active['status']}"
                 )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
