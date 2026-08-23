@@ -3063,6 +3063,113 @@ def test_create_task_skills_lists_all_toolset_typos(kanban_home):
         conn.close()
 
 
+def _install_profile_skill(home: Path, profile: str, skill: str) -> None:
+    skill_dir = home / "profiles" / profile / "skills" / "test" / skill
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {skill}\ndescription: test skill\n---\n",
+        encoding="utf-8",
+    )
+
+
+def test_create_task_rejects_skill_missing_from_existing_assignee(kanban_home):
+    """A known profile must not receive a force-pin it cannot load."""
+    _install_profile_skill(kanban_home, "auditor", "installed-skill")
+    conn = kb.connect()
+    try:
+        with pytest.raises(
+            ValueError,
+            match="unknown skill.*auditor.*missing-skill",
+        ):
+            kb.create_task(
+                conn,
+                title="misconfigured audit",
+                assignee="auditor",
+                skills=["missing-skill"],
+            )
+    finally:
+        conn.close()
+
+
+def test_set_task_skills_amends_only_blocked_unclaimed_task(kanban_home):
+    """Recovery clears a bad pin without changing routing or lifecycle state."""
+    _install_profile_skill(kanban_home, "auditor", "installed-skill")
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="blocked audit",
+            body="preserve me",
+            assignee="auditor",
+            skills=["installed-skill"],
+            model_override="test-model",
+            provider_override="test-provider",
+        )
+        assert kb.block_task(conn, tid, reason="bad forced skill")
+        before = kb.get_task(conn, tid)
+
+        assert kb.set_task_skills(conn, tid, []) is True
+        after = kb.get_task(conn, tid)
+
+        assert after.skills == []
+        assert after.status == "blocked"
+        assert after.current_run_id is None
+        for field in (
+            "title", "body", "assignee", "priority", "workspace_kind",
+            "workspace_path", "model_override", "provider_override",
+        ):
+            assert getattr(after, field) == getattr(before, field)
+        event = kb.list_events(conn, tid)[-1]
+        assert event.kind == "skills_amended"
+        assert event.payload == {
+            "old_skills": ["installed-skill"],
+            "new_skills": [],
+        }
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("terminal_state", ["running", "archived"])
+def test_set_task_skills_rejects_running_and_archived(kanban_home, terminal_state):
+    _install_profile_skill(kanban_home, "auditor", "installed-skill")
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title=f"{terminal_state} audit",
+            assignee="auditor",
+            skills=["installed-skill"],
+        )
+        if terminal_state == "running":
+            assert kb.claim_task(conn, tid, claimer="test") is not None
+        else:
+            assert kb.archive_task(conn, tid)
+
+        with pytest.raises(RuntimeError, match=terminal_state):
+            kb.set_task_skills(conn, tid, [])
+        assert kb.get_task(conn, tid).skills == ["installed-skill"]
+    finally:
+        conn.close()
+
+
+def test_set_task_skills_rejects_unknown_assignee_skill(kanban_home):
+    _install_profile_skill(kanban_home, "auditor", "installed-skill")
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="blocked audit",
+            assignee="auditor",
+            skills=["installed-skill"],
+        )
+        assert kb.block_task(conn, tid, reason="repair")
+        with pytest.raises(ValueError, match="missing-skill"):
+            kb.set_task_skills(conn, tid, ["missing-skill"])
+        assert kb.get_task(conn, tid).skills == ["installed-skill"]
+    finally:
+        conn.close()
+
+
 def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
     """Dispatcher argv must carry one `--skills X` pair per task skill,
     in declared order. No skill is auto-loaded anymore."""

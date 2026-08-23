@@ -1568,6 +1568,72 @@ def test_create_task_with_toolset_name_in_skills_is_rejected(client):
     assert "toolset name" in r.json()["detail"]
 
 
+def test_patch_blocked_task_skills_roundtrips_with_event(client, kanban_home):
+    skill_dir = (
+        kanban_home / "profiles" / "auditor" / "skills" / "test" / "audit-skill"
+    )
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: audit-skill\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "recover audit",
+            "assignee": "auditor",
+            "skills": ["audit-skill"],
+            "model_override": "test-model",
+            "provider_override": "test-provider",
+        },
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_reason": "bad pin"},
+    ).status_code == 200
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"skills": []},
+    )
+
+    assert response.status_code == 200, response.text
+    updated = response.json()["task"]
+    assert updated["skills"] == []
+    assert updated["status"] == "blocked"
+    assert updated["assignee"] == "auditor"
+    assert updated["model_override"] == "test-model"
+    assert updated["provider_override"] == "test-provider"
+    detail = client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()
+    event = detail["events"][-1]
+    assert event["kind"] == "skills_amended"
+    assert event["payload"] == {
+        "old_skills": ["audit-skill"],
+        "new_skills": [],
+    }
+
+
+def test_patch_skills_rejects_running_task(client, kanban_home):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "live", "assignee": "auditor"},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        assert kb.claim_task(conn, task["id"], claimer="test") is not None
+    finally:
+        conn.close()
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"skills": []},
+    )
+    assert response.status_code == 409
+    assert "running" in response.json()["detail"]
+
+
 
 # ---------------------------------------------------------------------------
 # Dispatcher-presence warning in POST /tasks response

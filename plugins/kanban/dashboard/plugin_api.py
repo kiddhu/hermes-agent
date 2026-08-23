@@ -834,6 +834,9 @@ class UpdateTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     clear_model_override: bool = False
+    # Exact replacement; [] clears every force-loaded skill pin. The kernel
+    # permits this only while the task is blocked and unclaimed.
+    skills: Optional[list[str]] = None
 
 
 @router.patch("/tasks/{task_id}")
@@ -844,6 +847,25 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        # Recovery must not smuggle an unblock, reassignment, body edit, or
+        # model change into the same request as the skill-pin correction.
+        if payload.skills is not None:
+            other_fields = payload.model_dump(exclude_unset=True)
+            other_fields.pop("skills", None)
+            if other_fields:
+                raise HTTPException(
+                    status_code=400,
+                    detail="skills amendment must be the only field in the request",
+                )
+            try:
+                ok = kanban_db.set_task_skills(conn, task_id, payload.skills)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except RuntimeError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            if not ok:
+                raise HTTPException(status_code=404, detail="task not found")
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:

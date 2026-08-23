@@ -3351,6 +3351,102 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """Normalize and validate force-loaded task skill identifiers."""
+    if skills is None:
+        return None
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    toolset_typos: list[str] = []
+    for skill in skills:
+        if not skill:
+            continue
+        name = str(skill).strip()
+        if not name:
+            continue
+        if "," in name:
+            raise ValueError(
+                f"skill name cannot contain comma: {name!r} "
+                f"(pass a list of separate names instead of a comma-joined string)"
+            )
+        if name.casefold() in KNOWN_TOOLSET_NAMES:
+            toolset_typos.append(name)
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+    if toolset_typos:
+        quoted = ", ".join(repr(name) for name in toolset_typos)
+        noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
+        raise ValueError(
+            f"{quoted} {noun}, not skill name(s). "
+            "Put toolsets in the assignee profile's `toolsets:` config "
+            "instead of per-task skills. Skills are named skill bundles "
+            "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
+            "capabilities (e.g. `web`, `browser`, `terminal`)."
+        )
+    return cleaned
+
+
+def _validate_assignee_skills(
+    assignee: Optional[str], skills: Optional[list[str]],
+) -> None:
+    """Fail early when a known profile cannot load a local skill pin."""
+    if not assignee or not skills:
+        return
+
+    from agent.skill_utils import (
+        get_disabled_skill_names,
+        get_external_skills_dirs,
+        is_excluded_skill_path,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli import profiles as profiles_mod
+
+    if not profiles_mod.profile_exists(assignee):
+        return
+    profile_dir = profiles_mod.get_profile_dir(assignee)
+    skills_dir = profile_dir / "skills"
+    token = set_hermes_home_override(profile_dir)
+    try:
+        external_dirs = get_external_skills_dirs()
+        disabled = get_disabled_skill_names()
+    finally:
+        reset_hermes_home_override(token)
+
+    available: set[str] = set()
+    for root in [skills_dir, *external_dirs]:
+        if not root.is_dir():
+            continue
+        for skill_md in root.rglob("SKILL.md"):
+            if is_excluded_skill_path(skill_md, root=root):
+                continue
+            try:
+                rel = skill_md.relative_to(root)
+            except ValueError:
+                continue
+            parts = rel.parts[:-1]
+            if not parts:
+                continue
+            available.add(parts[-1])
+            available.add("/".join(parts))
+
+    # Plugin-qualified skills have a separate registry and are resolved at
+    # worker startup. Plain local identifiers are deterministic here.
+    missing = [
+        name for name in skills
+        if ":" not in name and (name not in available or name in disabled)
+    ]
+    if missing:
+        quoted = ", ".join(repr(name) for name in missing)
+        raise ValueError(
+            f"unknown skill(s) for assignee {assignee!r}: {quoted}. "
+            "Install the skill for that profile or omit the forced skill pin."
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3531,50 +3627,10 @@ def create_task(
 
     parents = tuple(p for p in parents if p)
 
-    # Normalise + validate skills: strip whitespace, drop empties, dedupe
-    # (preserving order). Refuse commas inside a single name so we don't
-    # invisibly splatter a comma-joined string into one argv slot — the
-    # `hermes --skills X,Y` comma syntax is handled in the dispatcher,
-    # not here.
-    skills_list: Optional[list[str]] = None
-    if skills is not None:
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        # Collect all toolset-name confusions up front so the user sees the
-        # whole list at once. Raising on the first hit is friendly when the
-        # input has one mistake, but agents that confuse skills with toolsets
-        # usually pass several at once (`skills=["web", "browser", "terminal"]`)
-        # and serial-correcting one per failure round-trips wastes tokens.
-        toolset_typos: list[str] = []
-        for s in skills:
-            if not s:
-                continue
-            name = str(s).strip()
-            if not name:
-                continue
-            if "," in name:
-                raise ValueError(
-                    f"skill name cannot contain comma: {name!r} "
-                    f"(pass a list of separate names instead of a comma-joined string)"
-                )
-            if name.casefold() in KNOWN_TOOLSET_NAMES:
-                toolset_typos.append(name)
-                continue
-            if name in seen:
-                continue
-            seen.add(name)
-            cleaned.append(name)
-        if toolset_typos:
-            quoted = ", ".join(repr(n) for n in toolset_typos)
-            noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
-            raise ValueError(
-                f"{quoted} {noun}, not skill name(s). "
-                "Put toolsets in the assignee profile's `toolsets:` config "
-                "instead of per-task skills. Skills are named skill bundles "
-                "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
-                "capabilities (e.g. `web`, `browser`, `terminal`)."
-            )
-        skills_list = cleaned
+    # Reject deterministic profile/skill mismatches before they consume the
+    # dispatcher's retry budget.
+    skills_list = _normalize_task_skills(skills)
+    _validate_assignee_skills(assignee, skills_list)
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -3913,6 +3969,45 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         _append_event(conn, task_id, "assigned", {"assignee": profile})
+        return True
+
+
+def set_task_skills(
+    conn: sqlite3.Connection,
+    task_id: str,
+    skills: Optional[Iterable[str]],
+) -> bool:
+    """Amend force-loaded skills on a blocked, unclaimed task."""
+    skills_list = _normalize_task_skills(skills)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] != "blocked":
+            raise RuntimeError(
+                f"cannot amend skills on {row['status']} task {task_id}; "
+                "task must be blocked and unclaimed"
+            )
+        if row["claim_lock"] is not None or row["current_run_id"] is not None:
+            raise RuntimeError(
+                f"cannot amend skills on claimed task {task_id}; "
+                "task must be blocked and unclaimed"
+            )
+        _validate_assignee_skills(row["assignee"], skills_list)
+        old_skills = Task.from_row(row).skills
+        conn.execute(
+            "UPDATE tasks SET skills = ? WHERE id = ?",
+            (json.dumps(skills_list) if skills_list is not None else None, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "skills_amended",
+            {"old_skills": old_skills, "new_skills": skills_list},
+        )
         return True
 
 
