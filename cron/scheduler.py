@@ -39,6 +39,7 @@ from typing import Any, List, Optional
 # the module) fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from agent.resource_denial_receipt import emit_resource_denial_receipt
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
@@ -3659,7 +3660,21 @@ def run_job(
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        try:
+            _cron_future = _cron_pool.submit(
+                _cron_context.run, agent.run_conversation, prompt
+            )
+        except (OSError, RuntimeError) as submit_err:
+            emit_resource_denial_receipt(
+                submit_err,
+                component="cron_scheduler",
+                caller="agent_conversation_submit",
+                job_id=job_id,
+                execution_id=job.get("execution_id"),
+                session_id=job.get("session_id"),
+            )
+            _cron_pool.shutdown(wait=False, cancel_futures=True)
+            raise
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -4341,6 +4356,14 @@ def tick(
             try:
                 return pool.submit(_run_and_release)
             except Exception as submit_err:
+                emit_resource_denial_receipt(
+                    submit_err,
+                    component="cron_scheduler",
+                    caller="job_executor_submit",
+                    job_id=job_id,
+                    execution_id=execution["id"],
+                    session_id=job.get("session_id"),
+                )
                 with _running_lock:
                     _running_job_ids.discard(job_id)
                 finish_execution(

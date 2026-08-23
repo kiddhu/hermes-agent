@@ -46,6 +46,8 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from agent.resource_denial_receipt import emit_resource_denial_receipt
+
 from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -764,6 +766,14 @@ class ProcessRegistry:
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                emit_resource_denial_receipt(
+                    e,
+                    component="tool_process_registry",
+                    caller="pty_process_or_reader_start",
+                    task_id=task_id,
+                    session_id=session_key,
+                    process_session_id=session.id,
+                )
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -777,19 +787,30 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {safe_command}"],
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                [user_shell, "-lic", f"set +m; {safe_command}"],
+                text=True,
+                cwd=session.cwd,
+                env=bg_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                **_popen_kwargs,
+            )
+        except OSError as exc:
+            emit_resource_denial_receipt(
+                exc,
+                component="tool_process_registry",
+                caller="background_process_spawn",
+                task_id=task_id,
+                session_id=session_key,
+                process_session_id=session.id,
+            )
+            raise
 
         session.process = proc
         session.pid = proc.pid
@@ -811,7 +832,15 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
             self._write_checkpoint()
-        except Exception:
+        except Exception as exc:
+            emit_resource_denial_receipt(
+                exc,
+                component="tool_process_registry",
+                caller="background_reader_thread_start",
+                task_id=task_id,
+                session_id=session_key,
+                process_session_id=session.id,
+            )
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.

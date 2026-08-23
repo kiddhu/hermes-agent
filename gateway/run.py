@@ -17663,12 +17663,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Run blocking work in the thread pool while preserving session contextvars."""
         loop = asyncio.get_running_loop()
         ctx = copy_context()
-        return await loop.run_in_executor(
-            self._get_executor(),
-            ctx.run,
-            func,
-            *args,
-        )
+        try:
+            future = loop.run_in_executor(
+                self._get_executor(),
+                ctx.run,
+                func,
+                *args,
+            )
+        except (OSError, RuntimeError) as exc:
+            from agent.resource_denial_receipt import emit_resource_denial_receipt
+            from gateway.session_context import get_session_env
+
+            emit_resource_denial_receipt(
+                exc,
+                component="gateway",
+                caller="session_executor_submit",
+                session_id=get_session_env("HERMES_SESSION_ID", ""),
+            )
+            raise
+        return await future
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work."""

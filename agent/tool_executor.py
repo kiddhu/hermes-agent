@@ -32,6 +32,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.resource_denial_receipt import emit_resource_denial_receipt
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -733,6 +734,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             propagate_context_to_thread(_run_tool), i, tc, name, args, parsed_calls[i][3]
                         )
                     except RuntimeError as submit_error:
+                        emit_resource_denial_receipt(
+                            submit_error,
+                            component="agent_tool_executor",
+                            caller="concurrent_tool_submit",
+                            task_id=effective_task_id,
+                            tool_name=name,
+                        )
                         if not _is_interpreter_shutdown_submit_error(submit_error):
                             raise
                         skipped_calls = runnable_calls[submit_index:]

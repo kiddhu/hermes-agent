@@ -92,6 +92,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from agent.resource_denial_receipt import emit_resource_denial_receipt
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -12539,6 +12540,16 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    except OSError as exc:
+        log_f.close()
+        emit_resource_denial_receipt(
+            exc,
+            component="kanban_dispatcher",
+            caller="worker_process_spawn",
+            task_id=task.id,
+            run_id=task.current_run_id,
+        )
+        raise
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's

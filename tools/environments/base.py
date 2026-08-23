@@ -23,6 +23,7 @@ from typing import IO, Callable, Protocol
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
+from agent.resource_denial_receipt import emit_resource_denial_receipt
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
@@ -230,7 +231,15 @@ def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
         except (BrokenPipeError, OSError):
             pass
 
-    threading.Thread(target=_write, daemon=True).start()
+    try:
+        threading.Thread(target=_write, daemon=True).start()
+    except RuntimeError as exc:
+        emit_resource_denial_receipt(
+            exc,
+            component="tool_environment",
+            caller="stdin_writer_thread_start",
+        )
+        raise
 
 
 def _popen_bash(
@@ -243,14 +252,22 @@ def _popen_bash(
     this and call :func:`_pipe_stdin` directly.
     """
     kwargs.setdefault("creationflags", windows_hide_flags())
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-        text=True, encoding="utf-8", errors="replace",
-        **kwargs,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace",
+            **kwargs,
+        )
+    except OSError as exc:
+        emit_resource_denial_receipt(
+            exc,
+            component="tool_environment",
+            caller="foreground_process_spawn",
+        )
+        raise
     if stdin_data is not None:
         _pipe_stdin(proc, stdin_data)
     return proc
