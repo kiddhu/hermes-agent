@@ -1462,15 +1462,19 @@ def _handle_archive(args: dict, **kw) -> str:
                     already_archived=True,
                 )
             actor = os.environ.get("HERMES_PROFILE") or "kanban-orchestrator"
-            ok = kb.archive_task(
-                conn,
-                tid,
-                reason=reason,
-                actor=actor,
-                source="kanban_archive",
-                fail_if_active_run=True,
-                expected_status="todo",
-            )
+            # The ContextVar-backed capability proves this call passed the live
+            # orchestrator guard above; archive_task will not mint a factory
+            # terminal-write grant from forgeable args/env alone.
+            with kb._authenticated_strict_orchestrator_archive():
+                ok = kb.archive_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    actor=actor,
+                    source="kanban_archive",
+                    fail_if_active_run=True,
+                    expected_status="todo",
+                )
             if not ok:
                 # A concurrent identical replay may have won after our read.
                 # Treat the observed terminal state as success, but never mask a

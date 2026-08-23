@@ -1604,6 +1604,23 @@ _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
+# Set only around the orchestrator-only ``kanban_archive`` handler after its
+# live role check passes. A ContextVar keeps concurrent agent/tool calls
+# isolated and gives ``archive_task`` call-chain provenance that caller-supplied
+# audit strings or mutable environment variables cannot provide.
+_STRICT_ORCHESTRATOR_ARCHIVE_AUTH = ContextVar(
+    "kanban_strict_orchestrator_archive_auth", default=False,
+)
+
+
+@contextlib.contextmanager
+def _authenticated_strict_orchestrator_archive():
+    token = _STRICT_ORCHESTRATOR_ARCHIVE_AUTH.set(True)
+    try:
+        yield
+    finally:
+        _STRICT_ORCHESTRATOR_ARCHIVE_AUTH.reset(token)
+
 
 @contextlib.contextmanager
 def _allow_factory_terminal_write(conn: sqlite3.Connection, task_id: str):
@@ -8395,12 +8412,29 @@ def archive_task(
                     f"refusing to archive task {task_id}: expected status "
                     f"{expected_status}, found {active['status']}"
                 )
-        cur = conn.execute(
+        archive_sql = (
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
-            (task_id,),
+            "WHERE id = ? AND status != 'archived'"
         )
+        archive_params = (task_id,)
+        strict_orchestrator_archive = (
+            fail_if_active_run
+            and expected_status == "todo"
+            and source == "kanban_archive"
+            and bool(actor)
+            and _STRICT_ORCHESTRATOR_ARCHIVE_AUTH.get()
+        )
+        if strict_orchestrator_archive:
+            # Grant only the authenticated, orchestrator-only tool contract,
+            # after its todo/no-run/no-claim/no-PID checks above passed in this
+            # same transaction. Task-scoped and legacy recovery callers remain
+            # ungranted, so the factory trigger rejects stale or broad paths.
+            cur = _execute_factory_terminal_write(
+                conn, task_id, archive_sql, archive_params,
+            )
+        else:
+            cur = conn.execute(archive_sql, archive_params)
         if cur.rowcount != 1:
             return False
         # If archive happened while a run was still in flight (e.g. user

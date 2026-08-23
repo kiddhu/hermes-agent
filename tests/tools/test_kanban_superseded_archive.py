@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -101,6 +102,112 @@ def test_archive_superseded_todo_child_is_audited_idempotent_and_preserves_fanin
         assert kb.get_task(conn, child).status == "archived"
         assert kb.claim_task(conn, child) is None
         assert kb.get_task(conn, downstream).status == "ready"
+
+
+def test_archive_factory_gated_todo_child_uses_transaction_scoped_grant(
+    orchestrator_env,
+):
+    """Strict orchestrator archive may terminalize an idle factory-gated todo."""
+    kb = orchestrator_env
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="factory archive hold")
+        task_id = kb.create_task(
+            conn,
+            title="superseded factory child",
+            parents=[parent],
+            factory_build_gate=1,
+        )
+        downstream = kb.create_task(
+            conn,
+            title="post-archive convergence",
+            parents=[task_id],
+        )
+        assert kb.get_task(conn, task_id).status == "todo"
+        assert kb.get_task(conn, downstream).status == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM factory_terminal_write_grants"
+        ).fetchone()[0] == 0
+
+    from tools import kanban_tools as kt
+
+    reason = "superseded factory candidate"
+    archived = json.loads(
+        kt._handle_archive({"task_id": task_id, "reason": reason})
+    )
+    assert archived == {
+        "ok": True,
+        "task_id": task_id,
+        "status": "archived",
+        "already_archived": False,
+    }
+    assert kb._STRICT_ORCHESTRATOR_ARCHIVE_AUTH.get() is False
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "archived"
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert kb.list_runs(conn, task_id) == []
+        assert kb.get_task(conn, downstream).status == "ready"
+        assert conn.execute(
+            "SELECT factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()[0] is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM factory_terminal_write_grants"
+        ).fetchone()[0] == 0
+        archived_events = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "archived"
+        ]
+        assert len(archived_events) == 1
+        assert archived_events[0].payload == {
+            "reason": reason,
+            "actor": "factory-controller",
+            "source": "kanban_archive",
+        }
+
+
+def test_archive_factory_grant_and_transition_roll_back_together(
+    orchestrator_env, monkeypatch,
+):
+    kb = orchestrator_env
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="factory rollback hold")
+        task_id = kb.create_task(
+            conn,
+            title="factory rollback candidate",
+            parents=[parent],
+            factory_build_gate=1,
+        )
+        assert kb.get_task(conn, task_id).status == "todo"
+
+    original_append_event = kb._append_event
+
+    def fail_archive_event(conn, event_task_id, kind, *args, **kwargs):
+        if event_task_id == task_id and kind == "archived":
+            raise RuntimeError("injected archive event failure")
+        return original_append_event(conn, event_task_id, kind, *args, **kwargs)
+
+    monkeypatch.setattr(kb, "_append_event", fail_archive_event)
+    from tools import kanban_tools as kt
+
+    refused = json.loads(
+        kt._handle_archive({"task_id": task_id, "reason": "rollback probe"})
+    )
+    assert "injected archive event failure" in refused["error"]
+    assert kb._STRICT_ORCHESTRATOR_ARCHIVE_AUTH.get() is False
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM factory_terminal_write_grants"
+        ).fetchone()[0] == 0
+        assert not [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "archived"
+        ]
 
 
 def test_archive_requires_reason_and_rejects_unknown_task(orchestrator_env):
@@ -203,7 +310,14 @@ def test_archive_is_orchestrator_only_even_if_handler_is_called_stale(
 ):
     kb = orchestrator_env
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="foreign child", parents=[])
+        parent = kb.create_task(conn, title="foreign parent")
+        task_id = kb.create_task(
+            conn,
+            title="foreign child",
+            parents=[parent],
+            factory_build_gate=1,
+        )
+        assert kb.get_task(conn, task_id).status == "todo"
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
     from tools import kanban_tools as kt
@@ -213,4 +327,17 @@ def test_archive_is_orchestrator_only_even_if_handler_is_called_stale(
     )
     assert "orchestrator-only" in refused["error"]
     with kb.connect() as conn:
-        assert kb.get_task(conn, task_id).status == "ready"
+        with pytest.raises(sqlite3.IntegrityError, match="authenticated receipt"):
+            kb.archive_task(
+                conn,
+                task_id,
+                reason="stale direct caller",
+                actor="factory-controller",
+                source="kanban_archive",
+                fail_if_active_run=True,
+                expected_status="todo",
+            )
+        assert kb.get_task(conn, task_id).status == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM factory_terminal_write_grants"
+        ).fetchone()[0] == 0

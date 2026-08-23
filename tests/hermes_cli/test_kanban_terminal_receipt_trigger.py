@@ -157,6 +157,61 @@ def test_ungranted_factory_task_cannot_archive_from_nonterminal_state(kanban_hom
         assert task.status == "ready"
 
 
+def test_legacy_archive_api_cannot_grant_factory_terminal_write(kanban_home):
+    """Only the strict orchestrator archive contract receives a scoped grant."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="factory archive hold")
+        task_id = kb.create_task(
+            conn,
+            title="factory terminal fence",
+            parents=[parent],
+            factory_build_gate=1,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "todo"
+
+        with pytest.raises(sqlite3.IntegrityError, match="authenticated receipt"):
+            kb.archive_task(conn, task_id)
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM factory_terminal_write_grants"
+        ).fetchone()[0] == 0
+
+
+def test_forged_strict_archive_args_cannot_mint_orchestrator_grant(kanban_home):
+    """Audit strings and strict flags are not authentication provenance."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="factory archive hold")
+        task_id = kb.create_task(
+            conn,
+            title="factory terminal fence",
+            parents=[parent],
+            factory_build_gate=1,
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="authenticated receipt"):
+            kb.archive_task(
+                conn,
+                task_id,
+                reason="forged strict caller",
+                actor="kanban-orchestrator",
+                source="kanban_archive",
+                fail_if_active_run=True,
+                expected_status="todo",
+            )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM factory_terminal_write_grants"
+        ).fetchone()[0] == 0
+
+
 def test_failed_trigger_upgrade_preserves_existing_fence(kanban_home):
     """A failed CREATE must roll back its DROP instead of leaving no trigger."""
     with kb.connect() as conn:
