@@ -127,13 +127,16 @@ def emit_resource_denial_receipt(
     *,
     component: str,
     caller: str,
+    inherit_environment_identity: bool = False,
     **identity: Any,
 ) -> Optional[dict[str, Any]]:
     """Log and return a bounded receipt when *exc* is an allocation denial.
 
     Returns ``None`` for unrelated failures.  Receipt construction is
     best-effort and must never replace the original exception at the caller.
-    Only allowlisted scalar identity fields are retained.
+    Only allowlisted scalar identity fields are retained. Process-global worker
+    identity is inherited only when the caller explicitly opts in; unrelated
+    cron, gateway, and dispatcher domains must pass their own safe context.
     """
     try:
         kind = _failure_kind(exc)
@@ -143,7 +146,7 @@ def emit_resource_denial_receipt(
         safe_identity: dict[str, Any] = {}
         for key in _IDENTITY_KEYS:
             value = identity.get(key)
-            if value is None and key in _ENV_IDENTITY:
+            if value is None and inherit_environment_identity and key in _ENV_IDENTITY:
                 value = os.environ.get(_ENV_IDENTITY[key])
             if value is None or isinstance(value, bool):
                 continue

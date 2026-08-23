@@ -17672,13 +17672,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except (OSError, RuntimeError) as exc:
             from agent.resource_denial_receipt import emit_resource_denial_receipt
-            from gateway.session_context import get_session_env
+            from gateway.session_context import get_bound_session_env
 
             emit_resource_denial_receipt(
                 exc,
                 component="gateway",
                 caller="session_executor_submit",
-                session_id=get_session_env("HERMES_SESSION_ID", ""),
+                session_id=get_bound_session_env("HERMES_SESSION_ID", ""),
             )
             raise
         return await future

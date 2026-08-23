@@ -331,6 +331,20 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def get_bound_session_env(name: str, default: str = "") -> str:
+    """Read only the current ContextVar-backed session value.
+
+    Unlike :func:`get_session_env`, this never falls back to process-global
+    environment state. Use it for attribution where a stale or unrelated
+    ``HERMES_SESSION_*`` value would be worse than an omitted identity.
+    """
+    var = _VAR_MAP.get(name)
+    if var is None:
+        return default
+    value = var.get()
+    return default if value is _UNSET else value
+
+
 def declare_stateless_channel() -> None:
     """Declare that this session cannot receive an async background completion.
 

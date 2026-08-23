@@ -238,6 +238,7 @@ def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
             exc,
             component="tool_environment",
             caller="stdin_writer_thread_start",
+            inherit_environment_identity=True,
         )
         raise
 
@@ -266,6 +267,7 @@ def _popen_bash(
             exc,
             component="tool_environment",
             caller="foreground_process_spawn",
+            inherit_environment_identity=True,
         )
         raise
     if stdin_data is not None:

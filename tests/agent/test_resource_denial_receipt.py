@@ -71,7 +71,13 @@ def test_eagain_receipt_binds_safe_event_time_identity_and_cgroup(monkeypatch, c
     assert "prompt" not in serialized
 
 
-def test_thread_start_failure_is_classified_without_errno(caplog):
+def test_thread_start_failure_is_classified_without_cross_domain_env_identity(
+    monkeypatch, caplog
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_unrelated_worker")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999")
+    monkeypatch.setenv("HERMES_SESSION_ID", "unrelated-worker-session")
+
     with caplog.at_level(logging.ERROR, logger="agent.resource_denial_receipt"):
         emitted = emit_resource_denial_receipt(
             RuntimeError("can't start new thread"),
@@ -133,6 +139,7 @@ def test_worker_env_supplies_identity_when_low_level_caller_has_none(
             OSError(errno.EAGAIN, "blocked"),
             component="tool_environment",
             caller="foreground_process_spawn",
+            inherit_environment_identity=True,
         )
 
     assert emitted is not None
@@ -205,6 +212,9 @@ def test_cron_dispatch_thread_denial_emits_job_and_execution_identity(
     monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "job-resource-denial"}])
     monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_unrelated_worker")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999")
+    monkeypatch.setenv("HERMES_SESSION_ID", "unrelated-worker-session")
 
     with caplog.at_level(logging.ERROR, logger="agent.resource_denial_receipt"):
         assert scheduler.tick(verbose=False, sync=False) == 0
@@ -250,7 +260,7 @@ def test_tool_background_spawn_eagain_emits_task_and_session_identity(
 
 
 @pytest.mark.asyncio
-async def test_gateway_executor_denial_emits_durable_session_identity(
+async def test_gateway_executor_denial_does_not_inherit_process_global_identity(
     monkeypatch, caplog
 ):
     import gateway.run as gateway_run
@@ -262,7 +272,7 @@ async def test_gateway_executor_denial_emits_durable_session_identity(
     runner = object.__new__(gateway_run.GatewayRunner)
     monkeypatch.setattr(gateway_run.asyncio, "get_running_loop", lambda: BrokenLoop())
     monkeypatch.setattr(runner, "_get_executor", lambda: None)
-    monkeypatch.setenv("HERMES_SESSION_ID", "gateway-session")
+    monkeypatch.setenv("HERMES_SESSION_ID", "unrelated-worker-session")
 
     with caplog.at_level(logging.ERROR, logger="agent.resource_denial_receipt"):
         with pytest.raises(RuntimeError, match="can't start new thread"):
@@ -271,7 +281,33 @@ async def test_gateway_executor_denial_emits_durable_session_identity(
     receipt = _receipt_from_logs(caplog)
     assert receipt["component"] == "gateway"
     assert receipt["caller"] == "session_executor_submit"
-    assert receipt["identity"]["session_id"] == "gateway-session"
+    assert receipt["identity"] == {}
+
+
+@pytest.mark.asyncio
+async def test_gateway_executor_denial_uses_bound_session_context(monkeypatch, caplog):
+    import gateway.run as gateway_run
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    class BrokenLoop:
+        def run_in_executor(self, *_args, **_kwargs):
+            raise RuntimeError("can't start new thread")
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    monkeypatch.setattr(gateway_run.asyncio, "get_running_loop", lambda: BrokenLoop())
+    monkeypatch.setattr(runner, "_get_executor", lambda: None)
+    monkeypatch.setenv("HERMES_SESSION_ID", "unrelated-worker-session")
+    tokens = set_session_vars(session_id="gateway-session")
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="agent.resource_denial_receipt"):
+            with pytest.raises(RuntimeError, match="can't start new thread"):
+                await runner._run_in_executor_with_context(lambda: None)
+    finally:
+        clear_session_vars(tokens)
+
+    receipt = _receipt_from_logs(caplog)
+    assert receipt["identity"] == {"session_id": "gateway-session"}
 
 
 @pytest.mark.asyncio
