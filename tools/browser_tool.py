@@ -66,6 +66,11 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.auxiliary_client import call_llm
 from agent.redact import redact_cdp_url
+from agent.resource_denial_receipt import (
+    capture_cgroup_pids_snapshot,
+    emit_cgroup_pids_denial_receipt,
+    emit_resource_denial_receipt,
+)
 from hermes_constants import agent_browser_runnable, get_hermes_home
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
@@ -2441,6 +2446,8 @@ def _run_browser_command(
         command
     ] + args
 
+    cgroup_before = capture_cgroup_pids_snapshot()
+    direct_denial_receipt = None
     try:
         # Give each task its own socket directory to prevent concurrency conflicts.
         # Without this, parallel workers fight over the same default socket path,
@@ -2632,8 +2639,29 @@ def _run_browser_command(
                 result = {"success": True, "data": {}}
 
     except Exception as e:
+        direct_denial_receipt = emit_resource_denial_receipt(
+            e,
+            component="browser_tool",
+            caller="agent_browser_command_spawn",
+            inherit_environment_identity=True,
+            session_id=task_id,
+            tool_name=command,
+            process_session_id=session_info.get("session_name"),
+        )
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
+
+    if not result.get("success", False) and direct_denial_receipt is None:
+        emit_cgroup_pids_denial_receipt(
+            cgroup_before,
+            capture_cgroup_pids_snapshot(),
+            component="browser_tool",
+            caller="agent_browser_command",
+            inherit_environment_identity=True,
+            session_id=task_id,
+            tool_name=command,
+            process_session_id=session_info.get("session_name"),
+        )
 
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.

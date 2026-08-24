@@ -108,6 +108,11 @@ def _cgroup_snapshot() -> dict[str, Any]:
     return snapshot
 
 
+def capture_cgroup_pids_snapshot() -> dict[str, Any]:
+    """Return the bounded pids snapshot used by denial receipts."""
+    return _cgroup_snapshot()
+
+
 def _failure_kind(exc: BaseException) -> Optional[str]:
     message = str(exc).lower()
     if isinstance(exc, RuntimeError) and (
@@ -143,44 +148,115 @@ def emit_resource_denial_receipt(
         if kind is None:
             return None
 
-        safe_identity: dict[str, Any] = {}
-        for key in _IDENTITY_KEYS:
-            value = identity.get(key)
-            if value is None and inherit_environment_identity and key in _ENV_IDENTITY:
-                value = os.environ.get(_ENV_IDENTITY[key])
-            if value is None or isinstance(value, bool):
-                continue
-            if isinstance(value, int):
-                safe_identity[key] = value
-            elif isinstance(value, str):
-                bounded = _bounded_text(value)
-                if key == "run_id" and bounded.isdecimal():
-                    safe_identity[key] = int(bounded)
-                elif bounded:
-                    safe_identity[key] = bounded
-
-        receipt = {
-            "event": "resource_allocation_denial",
-            "event_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "failure_kind": kind,
-            "errno": exc.errno if isinstance(exc, OSError) else None,
-            "error_type": type(exc).__name__[:_MAX_TEXT],
-            "component": _bounded_text(component),
-            "caller": _bounded_text(caller),
-            "identity": safe_identity,
-            "process": {
-                "pid": os.getpid(),
-                "tid": threading.get_native_id(),
-                "starttime": _process_starttime(),
-            },
-            "cgroup": _cgroup_snapshot(),
-        }
-        logger.error(
-            "%s%s",
-            _RECEIPT_PREFIX,
-            json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+        return _emit_receipt(
+            failure_kind=kind,
+            error_number=exc.errno if isinstance(exc, OSError) else None,
+            error_type=type(exc).__name__,
+            component=component,
+            caller=caller,
+            inherit_environment_identity=inherit_environment_identity,
+            identity=identity,
         )
-        return receipt
     except Exception:
         logger.debug("resource denial receipt construction failed", exc_info=True)
         return None
+
+
+def emit_cgroup_pids_denial_receipt(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    component: str,
+    caller: str,
+    inherit_environment_identity: bool = False,
+    **identity: Any,
+) -> Optional[dict[str, Any]]:
+    """Emit when a failed child command spans a proven pids.max event delta.
+
+    This covers subprocesses such as Chromium that may consume the kernel
+    denial internally and return only a normalized protocol failure to their
+    Python parent. Callers must take both snapshots around one synchronous
+    failed command; this function is passive and does not poll or change
+    admission behavior.
+    """
+    try:
+        before_events = before.get("pids_events_max")
+        after_events = after.get("pids_events_max")
+        if (
+            not isinstance(before_events, int)
+            or not isinstance(after_events, int)
+            or after_events <= before_events
+        ):
+            return None
+        return _emit_receipt(
+            failure_kind="cgroup_pids_max_delta",
+            error_number=None,
+            error_type="CgroupPidsMaxDelta",
+            component=component,
+            caller=caller,
+            inherit_environment_identity=inherit_environment_identity,
+            identity=identity,
+            cgroup=after,
+            cgroup_before=before,
+            pids_events_max_delta=after_events - before_events,
+        )
+    except Exception:
+        logger.debug("resource denial receipt construction failed", exc_info=True)
+        return None
+
+
+def _emit_receipt(
+    *,
+    failure_kind: str,
+    error_number: Optional[int],
+    error_type: str,
+    component: str,
+    caller: str,
+    inherit_environment_identity: bool,
+    identity: dict[str, Any],
+    cgroup: Optional[dict[str, Any]] = None,
+    cgroup_before: Optional[dict[str, Any]] = None,
+    pids_events_max_delta: Optional[int] = None,
+) -> dict[str, Any]:
+    safe_identity: dict[str, Any] = {}
+    for key in _IDENTITY_KEYS:
+        value = identity.get(key)
+        if value is None and inherit_environment_identity and key in _ENV_IDENTITY:
+            value = os.environ.get(_ENV_IDENTITY[key])
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            safe_identity[key] = value
+        elif isinstance(value, str):
+            bounded = _bounded_text(value)
+            if key == "run_id" and bounded.isdecimal():
+                safe_identity[key] = int(bounded)
+            elif bounded:
+                safe_identity[key] = bounded
+
+    receipt = {
+        "event": "resource_allocation_denial",
+        "event_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "failure_kind": failure_kind,
+        "errno": error_number,
+        "error_type": _bounded_text(error_type),
+        "component": _bounded_text(component),
+        "caller": _bounded_text(caller),
+        "identity": safe_identity,
+        "process": {
+            "pid": os.getpid(),
+            "tid": threading.get_native_id(),
+            "starttime": _process_starttime(),
+        },
+        "cgroup": cgroup if cgroup is not None else _cgroup_snapshot(),
+    }
+    if cgroup_before is not None:
+        receipt["cgroup_before"] = cgroup_before
+    if pids_events_max_delta is not None:
+        receipt["pids_events_max_delta"] = pids_events_max_delta
+    logger.error(
+        "%s%s",
+        _RECEIPT_PREFIX,
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+    )
+    return receipt
