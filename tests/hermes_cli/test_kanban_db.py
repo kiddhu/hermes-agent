@@ -2222,6 +2222,25 @@ def _native_lifecycle_request_body(task_id: str, *, nonce: str = "restart-reques
     )
 
 
+def _invalid_native_lifecycle_request_body(task_id: str, shape: str) -> str:
+    exact = _native_lifecycle_request_body(task_id)
+    envelope = json.loads(exact)
+    request = envelope["native_lifecycle_request"]
+    if shape == "extra_envelope_key":
+        envelope["unrelated"] = True
+        return json.dumps(envelope)
+    if shape == "duplicate_envelope_key":
+        encoded_request = json.dumps(request)
+        return (
+            '{"native_lifecycle_request":'
+            f'{encoded_request},"native_lifecycle_request":{encoded_request}'
+            "}"
+        )
+    if shape == "duplicate_request_key":
+        return exact.replace('"version": 1', '"version": 1, "version": 1', 1)
+    raise AssertionError(f"unknown invalid request shape: {shape}")
+
+
 def _set_task_body(conn, task_id: str, body: str) -> None:
     conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, task_id))
 
@@ -2348,6 +2367,46 @@ def test_dispatch_malformed_native_lifecycle_request_blocks_without_callback_or_
         task = kb.get_task(conn, task_id)
         run = kb.latest_run(conn, task_id)
 
+    assert result.lifecycle_restart_requests == []
+    assert task is not None and task.status == "blocked"
+    assert run is not None and reason in (run.summary or "")
+
+
+@pytest.mark.parametrize(
+    "shape, reason",
+    [
+        ("extra_envelope_key", "envelope"),
+        ("duplicate_envelope_key", "duplicate"),
+        ("duplicate_request_key", "duplicate"),
+    ],
+)
+def test_dispatch_native_lifecycle_request_rejects_non_closed_json_without_callback_or_spawn(
+    kanban_home, all_assignees_spawnable, shape, reason
+):
+    callback_calls = []
+    spawn_calls = []
+
+    def evaluate(*_):
+        callback_calls.append(True)
+        return kb.NativeLifecycleDecision(True, "unexpected callback", {})
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="restart gm2", assignee="agent007")
+        _set_task_body(
+            conn,
+            task_id,
+            _invalid_native_lifecycle_request_body(task_id, shape),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_: spawn_calls.append(True),
+            lifecycle_request_fn=evaluate,
+        )
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+
+    assert callback_calls == []
+    assert spawn_calls == []
     assert result.lifecycle_restart_requests == []
     assert task is not None and task.status == "blocked"
     assert run is not None and reason in (run.summary or "")

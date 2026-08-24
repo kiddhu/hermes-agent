@@ -1324,6 +1324,19 @@ _NATIVE_LIFECYCLE_SERVICE_RE = re.compile(
 )
 
 
+class _DuplicateNativeLifecycleKey(ValueError):
+    """Raised when a closed Native lifecycle JSON object repeats a key."""
+
+
+def _native_lifecycle_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateNativeLifecycleKey(f"duplicate field: {key}")
+        result[key] = value
+    return result
+
+
 def parse_native_lifecycle_request(
     task: Task,
 ) -> tuple[Optional[NativeLifecycleRequest], Optional[str]]:
@@ -1337,11 +1350,16 @@ def parse_native_lifecycle_request(
     if f'"{_NATIVE_LIFECYCLE_KEY}"' not in body:
         return None, None
     try:
-        envelope = json.loads(body)
+        envelope = json.loads(body, object_pairs_hook=_native_lifecycle_object)
+    except _DuplicateNativeLifecycleKey as exc:
+        return None, f"invalid native lifecycle request JSON: {exc}"
     except (json.JSONDecodeError, TypeError) as exc:
         return None, f"invalid native lifecycle request JSON: {exc}"
-    if not isinstance(envelope, dict) or _NATIVE_LIFECYCLE_KEY not in envelope:
-        return None, "invalid native lifecycle request envelope"
+    if not isinstance(envelope, dict) or set(envelope) != {_NATIVE_LIFECYCLE_KEY}:
+        return None, (
+            "invalid native lifecycle request envelope: expected exactly "
+            f"{_NATIVE_LIFECYCLE_KEY}"
+        )
     raw = envelope[_NATIVE_LIFECYCLE_KEY]
     if not isinstance(raw, dict):
         return None, "native_lifecycle_request must be an object"

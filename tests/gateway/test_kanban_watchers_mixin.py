@@ -241,3 +241,72 @@ def test_native_lifecycle_request_temp_db_reaches_existing_sigusr1_path(
         kill_fn=lambda pid, sig: calls.append((pid, sig)),
     )
     assert calls == [(os.getpid(), SIGUSR1)]
+
+
+@pytest.mark.parametrize(
+    "invalid_body",
+    [
+        lambda task_id, request: json.dumps(
+            {"native_lifecycle_request": request, "unrelated": True}
+        ),
+        lambda task_id, request: (
+            '{"native_lifecycle_request":'
+            f'{json.dumps(request)},"native_lifecycle_request":{json.dumps(request)}'
+            "}"
+        ),
+        lambda task_id, request: json.dumps(
+            {"native_lifecycle_request": request}
+        ).replace('"version": 1', '"version": 1, "version": 1', 1),
+    ],
+    ids=["extra-envelope-key", "duplicate-envelope-key", "duplicate-request-key"],
+)
+def test_non_closed_native_lifecycle_json_cannot_reach_callback_spawn_or_signal(
+    tmp_path, monkeypatch, invalid_body
+):
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+
+    callback_calls = []
+    spawn_calls = []
+    signal_calls = []
+
+    def evaluate(*_):
+        callback_calls.append(True)
+        return kb.NativeLifecycleDecision(True, "unexpected callback", {})
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reject non-closed JSON", assignee="agent007")
+        request = {
+            "version": 1,
+            "action": "planned_gateway_restart",
+            "nonce": "integration-request-0001",
+            "task_id": task_id,
+            "target_service": "hermes-gateway-gm2.service",
+            "expected_pid": os.getpid(),
+            "expected_starttime": kb._process_starttime(),
+            "expected_invocation_id": "integration-invocation-123",
+            "expected_cgroup": "/system.slice/hermes-gateway-gm2.service",
+            "require_board_idle": True,
+        }
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            (invalid_body(task_id, request), task_id),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_: spawn_calls.append(True),
+            lifecycle_request_fn=evaluate,
+        )
+
+    assert not _dispatch_native_lifecycle_restart_signal(
+        result.lifecycle_restart_requests,
+        kill_fn=lambda *args: signal_calls.append(args),
+    )
+    assert callback_calls == []
+    assert spawn_calls == []
+    assert signal_calls == []
