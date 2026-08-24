@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -66,6 +67,56 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def successful_kanban_terminal_result(
+    tool_name: str,
+    result: Any,
+    *,
+    task_id: Optional[str] = None,
+) -> bool:
+    """Return whether a terminal result confirms this exact worker task.
+
+    Invocation alone is not terminal: ownership checks, goal judges, artifact
+    preservation, and board transitions can all reject the call. The Native
+    handlers return ``{"ok": true, "task_id": ...}`` only after the DB
+    transition succeeds, so both fields are required before the loop may stop.
+    """
+    if tool_name not in _TERMINAL_KANBAN_TOOLS:
+        return False
+    expected_task = (
+        task_id or os.environ.get("HERMES_KANBAN_TASK") or ""
+    ).strip()
+    if not expected_task:
+        return False
+    payload = result
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("ok") is True
+        and str(payload.get("task_id") or "").strip() == expected_task
+    )
+
+
+def session_succeeded_kanban_terminal(
+    messages: Iterable[dict] | None,
+) -> bool:
+    """True only after a successful exact-task terminal Native result."""
+    if not messages:
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        if successful_kanban_terminal_result(
+            str(msg.get("name") or ""), msg.get("content")
+        ):
+            return True
+    return False
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -82,7 +133,7 @@ def build_kanban_stop_nudge(
         return None
     if attempts >= max_attempts:
         return None
-    if session_called_kanban_terminal(messages):
+    if session_succeeded_kanban_terminal(messages):
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
@@ -105,4 +156,6 @@ __all__ = [
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
+    "session_succeeded_kanban_terminal",
+    "successful_kanban_terminal_result",
 ]

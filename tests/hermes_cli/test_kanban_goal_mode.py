@@ -15,6 +15,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -203,6 +204,32 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     )
     assert res["outcome"] == "completed_by_worker"
     assert turns == []  # no extra turns
+
+
+def test_quiet_goal_adapter_returns_before_db_or_judge_after_terminal_tool(
+    monkeypatch,
+):
+    """The first turn's terminal receipt must suppress the whole goal adapter."""
+    import cli
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t-terminal")
+    monkeypatch.setattr(
+        kb,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail(
+            "terminal first turn must not enter goal status/judge plumbing"
+        ),
+    )
+
+    fake_cli: Any = SimpleNamespace()
+    cli._run_kanban_goal_loop_q(
+        fake_cli,
+        {
+            "final_response": "",
+            "kanban_terminal": True,
+            "turn_exit_reason": "kanban_terminal_tool_succeeded",
+        },
+    )
 
 
 def test_loop_worker_completion_wins_when_judge_is_unavailable(monkeypatch):

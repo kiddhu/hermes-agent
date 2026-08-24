@@ -4348,6 +4348,139 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    @pytest.mark.parametrize(
+        ("tool_name", "tool_result"),
+        [
+            (
+                "kanban_complete",
+                '{"ok": true, "task_id": "t_exact", "run_id": 41}',
+            ),
+            (
+                "kanban_block",
+                '{"ok": true, "task_id": "t_exact", "run_id": 41, '
+                '"status": "blocked", "block_kind": "needs_input"}',
+            ),
+        ],
+    )
+    def test_successful_exact_kanban_terminal_stops_before_next_provider_call(
+        self, agent, monkeypatch, tool_name, tool_result
+    ):
+        self._setup_agent(agent)
+        agent.valid_tool_names = set(agent.valid_tool_names) | {tool_name}
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_exact")
+        tc = _mock_tool_call(name=tool_name, arguments="{}", call_id="terminal-1")
+        terminal_response = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc]
+        )
+        forbidden_continuation = _mock_response(
+            content="This provider call must not happen", finish_reason="stop"
+        )
+        agent.client.chat.completions.create.side_effect = [
+            terminal_response,
+            forbidden_continuation,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value=tool_result) as tool,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("work kanban task t_exact")
+
+        assert result["api_calls"] == 1
+        assert result["kanban_terminal"] is True
+        assert result["turn_exit_reason"] == "kanban_terminal_tool_succeeded"
+        assert agent.client.chat.completions.create.call_count == 1
+        tool.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "tool_result",
+        [
+            '{"error": "completion rejected; task remains running"}',
+            '{"ok": true, "task_id": "t_other", "run_id": 41}',
+        ],
+    )
+    def test_failed_or_foreign_kanban_terminal_allows_model_correction(
+        self, agent, monkeypatch, tool_result
+    ):
+        self._setup_agent(agent)
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"kanban_complete"}
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_exact")
+        tc = _mock_tool_call(
+            name="kanban_complete", arguments="{}", call_id="terminal-1"
+        )
+        corrected_tc = _mock_tool_call(
+            name="kanban_complete", arguments="{}", call_id="terminal-2"
+        )
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(
+                content="", finish_reason="tool_calls", tool_calls=[corrected_tc]
+            ),
+        ]
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                side_effect=[
+                    tool_result,
+                    '{"ok": true, "task_id": "t_exact", "run_id": 42}',
+                ],
+            ) as tool,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("work kanban task t_exact")
+
+        assert result["api_calls"] == 2
+        assert result["kanban_terminal"] is True
+        assert tool.call_count == 2
+
+    def test_successful_kanban_terminal_skips_later_tools_in_same_batch(
+        self, agent, monkeypatch
+    ):
+        self._setup_agent(agent)
+        agent.valid_tool_names = set(agent.valid_tool_names) | {
+            "kanban_complete",
+            "write_file",
+        }
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_exact")
+        terminal = _mock_tool_call(
+            name="kanban_complete", arguments="{}", call_id="terminal-1"
+        )
+        later = _mock_tool_call(
+            name="write_file",
+            arguments='{"path": "after-terminal.txt", "content": "forbidden"}',
+            call_id="later-1",
+        )
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[terminal, later]
+        )
+
+        def _handle(name, *_args, **_kwargs):
+            if name == "kanban_complete":
+                return '{"ok": true, "task_id": "t_exact", "run_id": 41}'
+            pytest.fail(f"post-terminal tool executed: {name}")
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=_handle) as tool,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("work kanban task t_exact")
+
+        assert result["kanban_terminal"] is True
+        assert [call.args[0] for call in tool.call_args_list] == ["kanban_complete"]
+        later_result = next(
+            message
+            for message in result["messages"]
+            if message.get("tool_call_id") == "later-1"
+        )
+        assert "skipped" in later_result["content"].lower()
+
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
         self._setup_agent(agent)
         agent.verbose_logging = True

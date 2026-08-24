@@ -8,6 +8,8 @@ from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
+    session_succeeded_kanban_terminal,
+    successful_kanban_terminal_result,
 )
 
 
@@ -74,7 +76,12 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
                 }
             ],
         },
-        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
+        {
+            "role": "tool",
+            "name": "kanban_complete",
+            "tool_call_id": "1",
+            "content": '{"ok": true, "task_id": "t_abc"}',
+        },
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
@@ -83,9 +90,50 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
 def test_no_nudge_after_kanban_block(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
     messages = [
-        {"role": "tool", "name": "kanban_block", "tool_call_id": "1", "content": "blocked"},
+        {
+            "role": "tool",
+            "name": "kanban_block",
+            "tool_call_id": "1",
+            "content": '{"ok": true, "task_id": "t_abc", "status": "blocked"}',
+        },
     ]
     assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_failed_terminal_invocation_does_not_count_as_success(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "kanban_complete"}}],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_complete",
+            "content": '{"error": "task remains running"}',
+        },
+    ]
+
+    assert session_called_kanban_terminal(messages) is True
+    assert session_succeeded_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+def test_terminal_success_requires_exact_worker_task(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+
+    assert successful_kanban_terminal_result(
+        "kanban_complete", '{"ok": true, "task_id": "t_abc"}'
+    ) is True
+    assert successful_kanban_terminal_result(
+        "kanban_block", {"ok": True, "task_id": "t_abc", "status": "todo"}
+    ) is True
+    assert successful_kanban_terminal_result(
+        "kanban_complete", '{"ok": true, "task_id": "t_other"}'
+    ) is False
+    assert successful_kanban_terminal_result(
+        "kanban_complete", '{"error": "rejected"}'
+    ) is False
 
 
 def test_nudge_budget_exhausted(clear_kanban_env):

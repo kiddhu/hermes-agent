@@ -16648,6 +16648,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_result: Any) -> None:
     caller — a broken goal loop must never wedge a worker, the dispatcher's
     claim TTL / crash detection is the backstop.
     """
+    # The first conversation turn already persisted the successful exact
+    # Native terminal receipt. Avoid even entering DB/judge/continuation
+    # plumbing after that transition.
+    if isinstance(first_result, dict) and first_result.get("kanban_terminal") is True:
+        return
+
     import os as _os
 
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()

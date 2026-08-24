@@ -1182,6 +1182,9 @@ def run_conversation(
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
+    # Native terminalization is per-turn. Cached agents must not carry a prior
+    # worker receipt into a later user turn.
+    agent._kanban_terminal_succeeded = False
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -6052,6 +6055,17 @@ def run_conversation(
                     failed = True
                     break
 
+                if getattr(agent, "_kanban_terminal_succeeded", False) is True:
+                    # The exact assigned task has already transitioned in the
+                    # Native DB and every emitted tool_call_id has a persisted
+                    # result. Do not spend another provider iteration or allow
+                    # post-terminal tool mutations in this worker turn.
+                    _turn_exit_reason = "kanban_terminal_tool_succeeded"
+                    final_response = agent._strip_think_blocks(
+                        turn_content or ""
+                    ).strip()
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
@@ -6956,7 +6970,7 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-    return finalize_turn(
+    result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -6973,6 +6987,9 @@ def run_conversation(
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
+    if getattr(agent, "_kanban_terminal_succeeded", False) is True:
+        result["kanban_terminal"] = True
+    return result
 
 
 
