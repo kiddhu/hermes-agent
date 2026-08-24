@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 import pytest
 
+from agent import resource_denial_receipt
 from tools import browser_tool
 
 
@@ -187,3 +188,51 @@ def test_browser_protocol_failure_without_pids_delta_emits_no_receipt(
         record.getMessage().startswith("RESOURCE_ALLOCATION_DENIAL ")
         for record in caplog.records
     )
+
+
+def test_cgroup_receipt_drops_unknown_and_sensitive_snapshot_fields(
+    caplog: pytest.LogCaptureFixture,
+):
+    sensitive_value = "provider-payload-must-not-cross-receipt-boundary"
+    long_path = "/system.slice/" + "x" * 256
+    before = {
+        "path": long_path,
+        "pids_current": 20,
+        "pids_peak": True,
+        "pids_max": 120,
+        "pids_events_max": 1,
+        "provider_payload": sensitive_value,
+    }
+    after = {
+        "path": long_path,
+        "pids_current": False,
+        "pids_peak": 120,
+        "pids_max": "120",
+        "pids_events_max": 2,
+        "unknown": sensitive_value,
+    }
+
+    with caplog.at_level(logging.ERROR, logger="agent.resource_denial_receipt"):
+        receipt = resource_denial_receipt.emit_cgroup_pids_denial_receipt(
+            before,
+            after,
+            component="browser_tool",
+            caller="agent_browser_command",
+        )
+
+    assert receipt is not None
+    assert receipt["cgroup_before"] == {
+        "path": long_path[:128],
+        "pids_current": 20,
+        "pids_max": 120,
+        "pids_events_max": 1,
+    }
+    assert receipt["cgroup"] == {
+        "path": long_path[:128],
+        "pids_peak": 120,
+        "pids_events_max": 2,
+    }
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "provider_payload" not in log_text
+    assert "unknown" not in log_text
+    assert sensitive_value not in log_text

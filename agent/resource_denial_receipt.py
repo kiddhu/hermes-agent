@@ -36,6 +36,12 @@ _ENV_IDENTITY = {
     "run_id": "HERMES_KANBAN_RUN_ID",
     "session_id": "HERMES_SESSION_ID",
 }
+_CGROUP_COUNTER_KEYS = (
+    "pids_current",
+    "pids_peak",
+    "pids_max",
+    "pids_events_max",
+)
 
 
 def _read_text(path: str) -> Optional[str]:
@@ -47,6 +53,21 @@ def _read_text(path: str) -> Optional[str]:
 
 def _bounded_text(value: Any) -> str:
     return str(value)[:_MAX_TEXT]
+
+
+def _bounded_cgroup_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Retain only the bounded cgroup fields accepted by receipt logs."""
+    safe: dict[str, Any] = {}
+    path = snapshot.get("path")
+    if isinstance(path, str):
+        bounded_path = _bounded_text(path)
+        if bounded_path:
+            safe["path"] = bounded_path
+    for key in _CGROUP_COUNTER_KEYS:
+        value = snapshot.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            safe[key] = value
+    return safe
 
 
 def _parse_int(value: Optional[str]) -> Optional[int]:
@@ -180,8 +201,10 @@ def emit_cgroup_pids_denial_receipt(
     admission behavior.
     """
     try:
-        before_events = before.get("pids_events_max")
-        after_events = after.get("pids_events_max")
+        safe_before = _bounded_cgroup_snapshot(before)
+        safe_after = _bounded_cgroup_snapshot(after)
+        before_events = safe_before.get("pids_events_max")
+        after_events = safe_after.get("pids_events_max")
         if (
             not isinstance(before_events, int)
             or not isinstance(after_events, int)
@@ -196,8 +219,8 @@ def emit_cgroup_pids_denial_receipt(
             caller=caller,
             inherit_environment_identity=inherit_environment_identity,
             identity=identity,
-            cgroup=after,
-            cgroup_before=before,
+            cgroup=safe_after,
+            cgroup_before=safe_before,
             pids_events_max_delta=after_events - before_events,
         )
     except Exception:
@@ -248,10 +271,12 @@ def _emit_receipt(
             "tid": threading.get_native_id(),
             "starttime": _process_starttime(),
         },
-        "cgroup": cgroup if cgroup is not None else _cgroup_snapshot(),
+        "cgroup": _bounded_cgroup_snapshot(
+            cgroup if cgroup is not None else _cgroup_snapshot()
+        ),
     }
     if cgroup_before is not None:
-        receipt["cgroup_before"] = cgroup_before
+        receipt["cgroup_before"] = _bounded_cgroup_snapshot(cgroup_before)
     if pids_events_max_delta is not None:
         receipt["pids_events_max_delta"] = pids_events_max_delta
     logger.error(
