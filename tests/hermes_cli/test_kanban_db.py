@@ -2203,6 +2203,181 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
 # Dispatcher
 # ---------------------------------------------------------------------------
 
+def _native_lifecycle_request_body(task_id: str, *, nonce: str = "restart-request-0001") -> str:
+    return json.dumps(
+        {
+            "native_lifecycle_request": {
+                "version": 1,
+                "action": "planned_gateway_restart",
+                "nonce": nonce,
+                "task_id": task_id,
+                "target_service": "hermes-gateway-gm2.service",
+                "expected_pid": 4242,
+                "expected_starttime": 98765,
+                "expected_invocation_id": "invocation-123",
+                "expected_cgroup": "/system.slice/hermes-gateway-gm2.service",
+                "require_board_idle": True,
+            }
+        }
+    )
+
+
+def _set_task_body(conn, task_id: str, body: str) -> None:
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, task_id))
+
+
+def test_dispatch_native_lifecycle_request_records_claim_bound_receipt_without_worker(
+    kanban_home, all_assignees_spawnable
+):
+    spawns = []
+    decisions = []
+
+    def evaluate(task, request):
+        decisions.append((task.id, request.nonce, task.current_run_id, task.claim_lock))
+        return kb.NativeLifecycleDecision(
+            accepted=True,
+            reason="exact runtime identity matched",
+            receipt={"actual_pid": 4242, "actual_starttime": 98765},
+        )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="restart gm2", assignee="agent007")
+        _set_task_body(conn, task_id, _native_lifecycle_request_body(task_id))
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawns.append(task.id),
+            lifecycle_request_fn=evaluate,
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert spawns == []
+    assert len(decisions) == 1
+    assert decisions[0][0:2] == (task_id, "restart-request-0001")
+    assert decisions[0][2] is not None and decisions[0][3]
+    assert task is not None and task.status == "ready"
+    assert task.current_run_id is None and task.claim_lock is None
+    assert len(result.lifecycle_restart_requests) == 1
+    receipt = result.lifecycle_restart_requests[0]
+    assert receipt["task_id"] == task_id
+    assert receipt["nonce"] == "restart-request-0001"
+    assert receipt["run_id"] == decisions[0][2]
+    assert receipt["claim_lock"] == decisions[0][3]
+    request_events = [e for e in events if e.kind == "lifecycle_restart_requested"]
+    assert len(request_events) == 1
+    assert request_events[0].run_id == decisions[0][2]
+    assert request_events[0].payload["claim_lock"] == decisions[0][3]
+    assert request_events[0].payload["receipt"]["actual_pid"] == 4242
+    assert runs[-1].status == "released"
+    assert runs[-1].outcome == "lifecycle_restart_requested"
+
+
+def test_dispatch_native_lifecycle_request_nonce_is_consumed_at_most_once(
+    kanban_home, all_assignees_spawnable
+):
+    evaluations = []
+    spawns = []
+
+    def evaluate(task, request):
+        evaluations.append(request.nonce)
+        return kb.NativeLifecycleDecision(True, "matched", {"actual_pid": 4242})
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="restart gm2", assignee="agent007")
+        _set_task_body(conn, task_id, _native_lifecycle_request_body(task_id))
+        first = kb.dispatch_once(conn, spawn_fn=lambda *_: None, lifecycle_request_fn=evaluate)
+        second = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawns.append(task.id) or 9001,
+            lifecycle_request_fn=evaluate,
+        )
+        events = kb.list_events(conn, task_id)
+
+    assert len(first.lifecycle_restart_requests) == 1
+    assert second.lifecycle_restart_requests == []
+    assert evaluations == ["restart-request-0001"]
+    assert spawns == [task_id]
+    assert len([e for e in events if e.kind == "lifecycle_restart_requested"]) == 1
+
+
+def test_dispatch_native_lifecycle_request_defers_until_board_is_idle(
+    kanban_home, all_assignees_spawnable
+):
+    evaluations = []
+    with kb.connect() as conn:
+        busy = kb.create_task(conn, title="busy", assignee="bob")
+        kb.claim_task(conn, busy)
+        task_id = kb.create_task(conn, title="restart gm2", assignee="agent007")
+        _set_task_body(conn, task_id, _native_lifecycle_request_body(task_id))
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_: pytest.fail("lifecycle request must not spawn while busy"),
+            lifecycle_request_fn=lambda *_: evaluations.append(True),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert evaluations == []
+    assert task is not None and task.status == "ready" and task.current_run_id is None
+    assert result.lifecycle_restart_deferred == [task_id]
+
+
+@pytest.mark.parametrize(
+    "request_patch, reason",
+    [
+        ({"nonce": "short"}, "nonce"),
+        ({"task_id": "t_deadbeef"}, "task_id"),
+        ({"action": "restart_any_service"}, "action"),
+        ({"require_board_idle": False}, "require_board_idle"),
+        ({"unexpected": "field"}, "unknown field"),
+    ],
+)
+def test_dispatch_malformed_native_lifecycle_request_blocks_without_callback_or_spawn(
+    kanban_home, all_assignees_spawnable, request_patch, reason
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="restart gm2", assignee="agent007")
+        body = json.loads(_native_lifecycle_request_body(task_id))
+        body["native_lifecycle_request"].update(request_patch)
+        _set_task_body(conn, task_id, json.dumps(body))
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_: pytest.fail("malformed lifecycle request must not spawn"),
+            lifecycle_request_fn=lambda *_: pytest.fail("malformed request must not reach callback"),
+        )
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+
+    assert result.lifecycle_restart_requests == []
+    assert task is not None and task.status == "blocked"
+    assert run is not None and reason in (run.summary or "")
+
+
+def test_dispatch_rejected_native_lifecycle_request_blocks_with_exact_reason(
+    kanban_home, all_assignees_spawnable
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="restart gm2", assignee="agent007")
+        _set_task_body(conn, task_id, _native_lifecycle_request_body(task_id))
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_: pytest.fail("rejected lifecycle request must not spawn"),
+            lifecycle_request_fn=lambda *_: kb.NativeLifecycleDecision(
+                False,
+                "expected_pid mismatch: expected 4242, actual 4243",
+                {"actual_pid": 4243},
+            ),
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert result.lifecycle_restart_requests == []
+    assert task is not None and task.status == "blocked"
+    rejected = [e for e in events if e.kind == "lifecycle_restart_rejected"]
+    assert len(rejected) == 1
+    assert "expected_pid mismatch" in rejected[0].payload["reason"]
+    assert rejected[0].payload["receipt"] == {"actual_pid": 4243}
+
 def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
     with kb.connect() as conn:
         t1 = kb.create_task(conn, title="a", assignee="alice")

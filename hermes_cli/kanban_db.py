@@ -1278,6 +1278,115 @@ class Task:
         )
 
 
+@dataclass(frozen=True)
+class NativeLifecycleRequest:
+    """Closed, exact-generation request carried by a Native kanban task."""
+
+    version: int
+    action: str
+    nonce: str
+    task_id: str
+    target_service: str
+    expected_pid: int
+    expected_starttime: int
+    expected_invocation_id: str
+    expected_cgroup: str
+    require_board_idle: bool
+
+
+@dataclass(frozen=True)
+class NativeLifecycleDecision:
+    """Gateway consumer verdict for a claimed lifecycle request."""
+
+    accepted: bool
+    reason: str
+    receipt: Mapping[str, Any] = field(default_factory=dict)
+
+
+_NATIVE_LIFECYCLE_KEY = "native_lifecycle_request"
+_NATIVE_LIFECYCLE_FIELDS = frozenset(
+    {
+        "version",
+        "action",
+        "nonce",
+        "task_id",
+        "target_service",
+        "expected_pid",
+        "expected_starttime",
+        "expected_invocation_id",
+        "expected_cgroup",
+        "require_board_idle",
+    }
+)
+_NATIVE_LIFECYCLE_NONCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$")
+_NATIVE_LIFECYCLE_SERVICE_RE = re.compile(
+    r"^hermes-gateway(?:-[a-z0-9][a-z0-9-]*)?\.service$"
+)
+
+
+def parse_native_lifecycle_request(
+    task: Task,
+) -> tuple[Optional[NativeLifecycleRequest], Optional[str]]:
+    """Parse the closed v1 shape, or return ``(None, None)`` when absent.
+
+    Opting into the control contract requires the entire body to be JSON. A
+    card is therefore either a normal worker prompt or an exact machine
+    request; prose cannot accidentally become a restart request.
+    """
+    body = task.body or ""
+    if f'"{_NATIVE_LIFECYCLE_KEY}"' not in body:
+        return None, None
+    try:
+        envelope = json.loads(body)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return None, f"invalid native lifecycle request JSON: {exc}"
+    if not isinstance(envelope, dict) or _NATIVE_LIFECYCLE_KEY not in envelope:
+        return None, "invalid native lifecycle request envelope"
+    raw = envelope[_NATIVE_LIFECYCLE_KEY]
+    if not isinstance(raw, dict):
+        return None, "native_lifecycle_request must be an object"
+    unknown = sorted(set(raw) - _NATIVE_LIFECYCLE_FIELDS)
+    if unknown:
+        return None, f"native lifecycle request has unknown field(s): {', '.join(unknown)}"
+    missing = sorted(_NATIVE_LIFECYCLE_FIELDS - set(raw))
+    if missing:
+        return None, f"native lifecycle request missing field(s): {', '.join(missing)}"
+    if raw["version"] != 1:
+        return None, "native lifecycle request version must be 1"
+    if raw["action"] != "planned_gateway_restart":
+        return None, "native lifecycle request action must be planned_gateway_restart"
+    nonce = raw["nonce"]
+    if not isinstance(nonce, str) or not _NATIVE_LIFECYCLE_NONCE_RE.fullmatch(nonce):
+        return None, "native lifecycle request nonce must be 16-128 safe characters"
+    if raw["task_id"] != task.id:
+        return None, "native lifecycle request task_id must match its carrier task"
+    service = raw["target_service"]
+    if not isinstance(service, str) or not _NATIVE_LIFECYCLE_SERVICE_RE.fullmatch(service):
+        return None, "native lifecycle request target_service is not a Hermes gateway unit"
+    for name in ("expected_pid", "expected_starttime"):
+        value = raw[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return None, f"native lifecycle request {name} must be a positive integer"
+    invocation_id = raw["expected_invocation_id"]
+    if not isinstance(invocation_id, str) or not (8 <= len(invocation_id) <= 128):
+        return None, "native lifecycle request expected_invocation_id is invalid"
+    cgroup = raw["expected_cgroup"]
+    if (
+        not isinstance(cgroup, str)
+        or not cgroup.startswith("/")
+        or ".." in cgroup.split("/")
+        or len(cgroup) > 512
+    ):
+        return None, "native lifecycle request expected_cgroup is invalid"
+    if not cgroup.endswith(f"/{service}"):
+        return None, (
+            "native lifecycle request expected_cgroup must identify target_service"
+        )
+    if raw["require_board_idle"] is not True:
+        return None, "native lifecycle request require_board_idle must be true"
+    return NativeLifecycleRequest(**raw), None
+
+
 @dataclass
 class Run:
     """In-memory view of a ``task_runs`` row.
@@ -5073,6 +5182,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    require_board_idle: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -5083,6 +5193,16 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Lifecycle control requests use this stronger CAS: the ready->running
+        # claim may only occur while no task is running on this board. Because
+        # BEGIN IMMEDIATE serializes writers, another claimer cannot cross this
+        # check before the request claim commits.
+        if require_board_idle:
+            busy = conn.execute(
+                "SELECT 1 FROM tasks WHERE status = 'running' LIMIT 1"
+            ).fetchone()
+            if busy:
+                return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -9146,6 +9266,10 @@ class DispatchResult:
     The preflight consult above is the primary guard; this is the TOCTOU
     backstop for the unavoidable preflight→child-acquire race.
     (AION-RL2-CORE-01-SESSION_ADMISSION)"""
+    lifecycle_restart_requests: list[dict[str, Any]] = field(default_factory=list)
+    """Durably accepted exact-generation requests awaiting SIGUSR1 delivery."""
+    lifecycle_restart_deferred: list[str] = field(default_factory=list)
+    """Exact lifecycle requests left ready because the board was not idle."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -11622,6 +11746,193 @@ def _assignee_session_capped(assignee: str) -> bool:
     return active >= max_sessions
 
 
+def _native_lifecycle_request_consumed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    nonce: str,
+) -> bool:
+    """Return whether this exact request nonce already has a durable receipt."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'lifecycle_restart_requested'",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if payload.get("nonce") == nonce:
+            return True
+    return False
+
+
+def _release_native_lifecycle_claim(
+    conn: sqlite3.Connection,
+    task: Task,
+    request: NativeLifecycleRequest,
+    decision: NativeLifecycleDecision,
+) -> Optional[dict[str, Any]]:
+    """Persist an accepted receipt and release the carrier for post-restart work."""
+    if task.current_run_id is None or not task.claim_lock:
+        return None
+    receipt = dict(decision.receipt)
+    # Prove the callback returned a bounded JSON-safe receipt before opening
+    # the transaction that releases the task.
+    encoded = json.dumps(receipt, ensure_ascii=False)
+    if len(encoded.encode("utf-8")) > 8192:
+        raise ValueError("native lifecycle receipt exceeds 8192 bytes")
+    payload = {
+        "version": request.version,
+        "action": request.action,
+        "nonce": request.nonce,
+        "target_service": request.target_service,
+        "run_id": int(task.current_run_id),
+        "claim_lock": task.claim_lock,
+        "reason": decision.reason,
+        "receipt": receipt,
+    }
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["status"] != "running"
+            or int(current["current_run_id"] or 0) != int(task.current_run_id)
+            or current["claim_lock"] != task.claim_lock
+            or _native_lifecycle_request_consumed(conn, task.id, request.nonce)
+        ):
+            return None
+        _append_event(
+            conn,
+            task.id,
+            "lifecycle_restart_requested",
+            payload,
+            run_id=int(task.current_run_id),
+        )
+        _end_run(
+            conn,
+            task.id,
+            outcome="lifecycle_restart_requested",
+            status="released",
+            summary=decision.reason,
+            metadata={"nonce": request.nonce, "target_service": request.target_service},
+        )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'ready', claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL, last_heartbeat_at = NULL
+             WHERE id = ? AND status = 'running' AND claim_lock = ?
+            """,
+            (task.id, task.claim_lock),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("native lifecycle request lost claim CAS")
+    return {
+        "task_id": task.id,
+        "nonce": request.nonce,
+        "run_id": int(task.current_run_id),
+        "claim_lock": task.claim_lock,
+        "target_service": request.target_service,
+    }
+
+
+def _dispatch_native_lifecycle_request(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    result: DispatchResult,
+    lifecycle_request_fn: Optional[
+        Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
+    ],
+    ttl_seconds: Optional[int],
+    dry_run: bool,
+) -> str:
+    """Consume one exact request before worker admission/spawn.
+
+    Returns ``absent``/``consumed`` for normal spawn handling, ``handled``
+    when the request was deferred or rejected, and ``accepted`` when the
+    caller must stop the tick and deliver SIGUSR1 only after the DB commit.
+    """
+    request, parse_error = parse_native_lifecycle_request(task)
+    if request is None and parse_error is None:
+        return "absent"
+    if request is not None and _native_lifecycle_request_consumed(
+        conn, task.id, request.nonce
+    ):
+        return "consumed"
+    if dry_run:
+        result.lifecycle_restart_deferred.append(task.id)
+        return "handled"
+
+    claimed = claim_task(
+        conn,
+        task.id,
+        ttl_seconds=ttl_seconds,
+        require_board_idle=request is not None,
+    )
+    if claimed is None:
+        if request is not None:
+            result.lifecycle_restart_deferred.append(task.id)
+        return "handled"
+
+    if parse_error is not None:
+        decision = NativeLifecycleDecision(False, parse_error, {})
+    elif lifecycle_request_fn is None:
+        decision = NativeLifecycleDecision(
+            False,
+            "native lifecycle request requires the embedded gateway consumer",
+            {},
+        )
+    else:
+        assert request is not None
+        try:
+            decision = lifecycle_request_fn(claimed, request)
+            if not isinstance(decision, NativeLifecycleDecision):
+                raise TypeError("consumer returned an invalid decision")
+        except Exception as exc:
+            decision = NativeLifecycleDecision(
+                False,
+                f"native lifecycle request consumer failed: {exc}",
+                {},
+            )
+
+    if not decision.accepted:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                claimed.id,
+                "lifecycle_restart_rejected",
+                {
+                    "nonce": request.nonce if request is not None else None,
+                    "reason": decision.reason,
+                    "receipt": dict(decision.receipt),
+                    "claim_lock": claimed.claim_lock,
+                },
+                run_id=claimed.current_run_id,
+            )
+        block_task(
+            conn,
+            claimed.id,
+            reason=decision.reason,
+            kind="capability",
+            expected_run_id=claimed.current_run_id,
+        )
+        return "handled"
+
+    if request is None:
+        raise RuntimeError("cannot accept a malformed native lifecycle request")
+    accepted = _release_native_lifecycle_claim(conn, claimed, request, decision)
+    if accepted is None:
+        result.lifecycle_restart_deferred.append(task.id)
+        return "handled"
+    result.lifecycle_restart_requests.append(accepted)
+    return "accepted"
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -11635,6 +11946,9 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    lifecycle_request_fn: Optional[
+        Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
+    ] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -11669,6 +11983,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            lifecycle_request_fn=lifecycle_request_fn,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -11685,6 +12000,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            lifecycle_request_fn=lifecycle_request_fn,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -11705,6 +12021,9 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    lifecycle_request_fn: Optional[
+        Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
+    ] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -11846,6 +12165,23 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
+        candidate = get_task(conn, row["id"])
+        if candidate is None:
+            continue
+        lifecycle_state = _dispatch_native_lifecycle_request(
+            conn,
+            candidate,
+            result=result,
+            lifecycle_request_fn=lifecycle_request_fn,
+            ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
+        )
+        if lifecycle_state == "accepted":
+            # One gateway restart per tick. The caller delivers SIGUSR1 only
+            # after this board transaction and dispatch lock have completed.
+            break
+        if lifecycle_state == "handled":
+            continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]

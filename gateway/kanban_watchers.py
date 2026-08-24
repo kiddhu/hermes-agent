@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +24,93 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+def _read_self_cgroup() -> Optional[str]:
+    """Return this process's unified cgroup path, or None when unavailable."""
+    try:
+        text = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+            return parts[2]
+    return None
+
+
+def _evaluate_native_lifecycle_restart_request(
+    task,
+    request,
+    *,
+    current_pid: Optional[int] = None,
+    current_starttime: Optional[int] = None,
+    current_invocation_id: Optional[str] = None,
+    current_service: Optional[str] = None,
+    current_cgroup: Optional[str] = None,
+):
+    """Bind one Native request to this exact claimed gateway generation."""
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli.gateway import get_service_name
+
+    if current_pid is None:
+        current_pid = os.getpid()
+    if current_starttime is None:
+        current_starttime = _kb._process_starttime()
+    if current_invocation_id is None:
+        current_invocation_id = os.environ.get("INVOCATION_ID", "")
+    if current_service is None:
+        current_service = f"{get_service_name()}.service"
+    if current_cgroup is None:
+        current_cgroup = _read_self_cgroup()
+
+    receipt = {
+        "actual_pid": current_pid,
+        "actual_starttime": current_starttime,
+        "actual_invocation_id": current_invocation_id,
+        "actual_service": current_service,
+        "actual_cgroup": current_cgroup,
+    }
+    if task.id != request.task_id:
+        return _kb.NativeLifecycleDecision(False, "task_id provenance mismatch", receipt)
+    if task.current_run_id is None or not task.claim_lock:
+        return _kb.NativeLifecycleDecision(False, "claim provenance is unbound", receipt)
+    comparisons = (
+        ("target_service", request.target_service, current_service),
+        ("expected_pid", request.expected_pid, current_pid),
+        ("expected_starttime", request.expected_starttime, current_starttime),
+        (
+            "expected_invocation_id",
+            request.expected_invocation_id,
+            current_invocation_id,
+        ),
+        ("expected_cgroup", request.expected_cgroup, current_cgroup),
+    )
+    for name, expected, actual in comparisons:
+        if expected != actual:
+            return _kb.NativeLifecycleDecision(
+                False,
+                f"{name} mismatch: expected {expected!r}, actual {actual!r}",
+                receipt,
+            )
+    return _kb.NativeLifecycleDecision(True, "exact runtime identity matched", receipt)
+
+
+def _dispatch_native_lifecycle_restart_signal(
+    accepted_requests,
+    *,
+    kill_fn=os.kill,
+    current_pid: Optional[int] = None,
+) -> bool:
+    """Deliver one accepted request through the existing SIGUSR1 path."""
+    if len(accepted_requests) != 1 or not hasattr(signal, "SIGUSR1"):
+        return False
+    try:
+        kill_fn(current_pid if current_pid is not None else os.getpid(), signal.SIGUSR1)
+    except OSError:
+        logger.exception("Failed to deliver accepted Native lifecycle request")
+        return False
+    return True
 
 
 def _resolve_auto_decompose_settings(
@@ -1225,6 +1313,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    lifecycle_request_fn=_evaluate_native_lifecycle_restart_request,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1277,7 +1366,14 @@ class GatewayKanbanWatchersMixin:
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
+                result = _tick_once_for_board(slug)
+                out.append((slug, result))
+                if result is not None and getattr(
+                    result, "lifecycle_restart_requests", None
+                ):
+                    # A gateway generation can accept only one restart per
+                    # tick, even when it dispatches several boards.
+                    break
             return out
 
         def _ready_nonempty() -> bool:
@@ -1439,6 +1535,30 @@ class GatewayKanbanWatchersMixin:
                 if _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
+                lifecycle_requests = [
+                    request
+                    for _slug, dispatch_result in (results or [])
+                    if dispatch_result is not None
+                    for request in (
+                        getattr(dispatch_result, "lifecycle_restart_requests", None)
+                        or []
+                    )
+                ]
+                if lifecycle_requests:
+                    request = lifecycle_requests[0]
+                    logger.warning(
+                        "kanban dispatcher: delivering accepted Native lifecycle "
+                        "request task=%s nonce=%s through SIGUSR1",
+                        request.get("task_id"),
+                        request.get("nonce"),
+                    )
+                    if not _dispatch_native_lifecycle_restart_signal(
+                        lifecycle_requests
+                    ):
+                        logger.error(
+                            "kanban dispatcher: accepted Native lifecycle request "
+                            "could not be delivered; task will continue without retry"
+                        )
                 any_spawned = False
                 for slug, res in (results or []):
                     if res is not None and getattr(res, "spawned", None):
