@@ -23,6 +23,8 @@ from gateway.kanban_watchers import (
 )
 from hermes_cli.kanban_db import NativeLifecycleRequest
 
+SIGUSR1 = getattr(signal, "SIGUSR1", None)
+
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
     "_kanban_dispatcher_watcher",
@@ -163,6 +165,7 @@ def test_native_lifecycle_request_rejects_unbound_claim_provenance():
     assert "claim provenance" in decision.reason
 
 
+@pytest.mark.skipif(SIGUSR1 is None, reason="SIGUSR1 is POSIX-only")
 def test_dispatch_native_lifecycle_restart_signal_uses_existing_sigusr1_path():
     calls = []
     accepted = [{"task_id": "t_1234abcd", "nonce": "restart-request-0001"}]
@@ -172,7 +175,7 @@ def test_dispatch_native_lifecycle_restart_signal_uses_existing_sigusr1_path():
         kill_fn=lambda pid, sig: calls.append((pid, sig)),
         current_pid=4242,
     )
-    assert calls == [(4242, signal.SIGUSR1)]
+    assert calls == [(4242, SIGUSR1)]
 
 
 def test_dispatch_native_lifecycle_restart_signal_fails_closed_without_exact_single_request():
@@ -185,6 +188,7 @@ def test_dispatch_native_lifecycle_restart_signal_fails_closed_without_exact_sin
     assert calls == []
 
 
+@pytest.mark.skipif(SIGUSR1 is None, reason="SIGUSR1 is POSIX-only")
 def test_native_lifecycle_request_temp_db_reaches_existing_sigusr1_path(
     tmp_path, monkeypatch
 ):
@@ -236,4 +240,4 @@ def test_native_lifecycle_request_temp_db_reaches_existing_sigusr1_path(
         result.lifecycle_restart_requests,
         kill_fn=lambda pid, sig: calls.append((pid, sig)),
     )
-    assert calls == [(os.getpid(), signal.SIGUSR1)]
+    assert calls == [(os.getpid(), SIGUSR1)]

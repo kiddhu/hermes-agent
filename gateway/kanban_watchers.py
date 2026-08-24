@@ -103,10 +103,11 @@ def _dispatch_native_lifecycle_restart_signal(
     current_pid: Optional[int] = None,
 ) -> bool:
     """Deliver one accepted request through the existing SIGUSR1 path."""
-    if len(accepted_requests) != 1 or not hasattr(signal, "SIGUSR1"):
+    sigusr1 = getattr(signal, "SIGUSR1", None)
+    if len(accepted_requests) != 1 or sigusr1 is None:
         return False
     try:
-        kill_fn(current_pid if current_pid is not None else os.getpid(), signal.SIGUSR1)
+        kill_fn(current_pid if current_pid is not None else os.getpid(), sigusr1)
     except OSError:
         logger.exception("Failed to deliver accepted Native lifecycle request")
         return False
