@@ -1322,13 +1322,28 @@ _NATIVE_LIFECYCLE_NONCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$")
 _NATIVE_LIFECYCLE_SERVICE_RE = re.compile(
     r"^hermes-gateway(?:-[a-z0-9][a-z0-9-]*)?\.service$"
 )
+_NATIVE_LIFECYCLE_CANONICAL_KEY_RE = re.compile(
+    r'^\s*\{\s*"native_lifecycle_request"\s*:'
+)
 
 
 class _DuplicateNativeLifecycleKey(ValueError):
     """Raised when a closed Native lifecycle JSON object repeats a key."""
 
 
-def _native_lifecycle_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+class _NativeLifecycleObjectPairs(list[tuple[str, Any]]):
+    """Decoded JSON object that preserves keys until lifecycle classification."""
+
+
+def _native_lifecycle_object(
+    pairs: list[tuple[str, Any]],
+) -> _NativeLifecycleObjectPairs:
+    return _NativeLifecycleObjectPairs(pairs)
+
+
+def _native_lifecycle_dict(
+    pairs: _NativeLifecycleObjectPairs,
+) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
@@ -1347,13 +1362,29 @@ def parse_native_lifecycle_request(
     request; prose cannot accidentally become a restart request.
     """
     body = task.body or ""
-    if f'"{_NATIVE_LIFECYCLE_KEY}"' not in body:
-        return None, None
     try:
-        envelope = json.loads(body, object_pairs_hook=_native_lifecycle_object)
-    except _DuplicateNativeLifecycleKey as exc:
-        return None, f"invalid native lifecycle request JSON: {exc}"
+        decoded = json.loads(body, object_pairs_hook=_native_lifecycle_object)
     except (json.JSONDecodeError, TypeError) as exc:
+        if f'"{_NATIVE_LIFECYCLE_KEY}"' not in body:
+            return None, None
+        return None, f"invalid native lifecycle request JSON: {exc}"
+    if not isinstance(decoded, _NativeLifecycleObjectPairs):
+        if f'"{_NATIVE_LIFECYCLE_KEY}"' not in body:
+            return None, None
+        return None, (
+            "invalid native lifecycle request envelope: expected exactly "
+            f"{_NATIVE_LIFECYCLE_KEY}"
+        )
+    if not any(key == _NATIVE_LIFECYCLE_KEY for key, _value in decoded):
+        return None, None
+    if not _NATIVE_LIFECYCLE_CANONICAL_KEY_RE.match(body):
+        return None, (
+            "invalid native lifecycle request envelope: expected canonical key "
+            f"{_NATIVE_LIFECYCLE_KEY}"
+        )
+    try:
+        envelope = _native_lifecycle_dict(decoded)
+    except _DuplicateNativeLifecycleKey as exc:
         return None, f"invalid native lifecycle request JSON: {exc}"
     if not isinstance(envelope, dict) or set(envelope) != {_NATIVE_LIFECYCLE_KEY}:
         return None, (
@@ -1361,8 +1392,12 @@ def parse_native_lifecycle_request(
             f"{_NATIVE_LIFECYCLE_KEY}"
         )
     raw = envelope[_NATIVE_LIFECYCLE_KEY]
-    if not isinstance(raw, dict):
+    if not isinstance(raw, _NativeLifecycleObjectPairs):
         return None, "native_lifecycle_request must be an object"
+    try:
+        raw = _native_lifecycle_dict(raw)
+    except _DuplicateNativeLifecycleKey as exc:
+        return None, f"invalid native lifecycle request JSON: {exc}"
     unknown = sorted(set(raw) - _NATIVE_LIFECYCLE_FIELDS)
     if unknown:
         return None, f"native lifecycle request has unknown field(s): {', '.join(unknown)}"

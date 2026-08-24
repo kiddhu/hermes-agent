@@ -257,18 +257,28 @@ def test_native_lifecycle_request_temp_db_reaches_existing_sigusr1_path(
         lambda task_id, request: json.dumps(
             {"native_lifecycle_request": request}
         ).replace('"version": 1', '"version": 1, "version": 1', 1),
+        lambda task_id, request: json.dumps(
+            {"native_lifecycle_request": request}
+        ).replace("native_lifecycle_request", r"native\u005flifecycle_request", 1),
     ],
-    ids=["extra-envelope-key", "duplicate-envelope-key", "duplicate-request-key"],
+    ids=[
+        "extra-envelope-key",
+        "duplicate-envelope-key",
+        "duplicate-request-key",
+        "escaped-envelope-key",
+    ],
 )
 def test_non_closed_native_lifecycle_json_cannot_reach_callback_spawn_or_signal(
     tmp_path, monkeypatch, invalid_body
 ):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import profiles
 
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
     kb.init_db()
 
     callback_calls = []

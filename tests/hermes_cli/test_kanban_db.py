@@ -2238,6 +2238,12 @@ def _invalid_native_lifecycle_request_body(task_id: str, shape: str) -> str:
         )
     if shape == "duplicate_request_key":
         return exact.replace('"version": 1', '"version": 1, "version": 1', 1)
+    if shape == "escaped_envelope_key":
+        return exact.replace(
+            '"native_lifecycle_request"',
+            r'"native\u005flifecycle_request"',
+            1,
+        )
     raise AssertionError(f"unknown invalid request shape: {shape}")
 
 
@@ -2378,6 +2384,7 @@ def test_dispatch_malformed_native_lifecycle_request_blocks_without_callback_or_
         ("extra_envelope_key", "envelope"),
         ("duplicate_envelope_key", "duplicate"),
         ("duplicate_request_key", "duplicate"),
+        ("escaped_envelope_key", "envelope"),
     ],
 )
 def test_dispatch_native_lifecycle_request_rejects_non_closed_json_without_callback_or_spawn(
