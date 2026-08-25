@@ -1292,6 +1292,10 @@ class NativeLifecycleRequest:
     expected_invocation_id: str
     expected_cgroup: str
     require_board_idle: bool
+    # Added for the bounded dashboard transition.  Legacy gateway restart
+    # requests remain valid without it so v1's existing SIGUSR1 contract is
+    # not silently broken.
+    expires_at: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -1316,12 +1320,15 @@ _NATIVE_LIFECYCLE_FIELDS = frozenset(
         "expected_invocation_id",
         "expected_cgroup",
         "require_board_idle",
+        "expires_at",
     }
 )
 _NATIVE_LIFECYCLE_NONCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$")
 _NATIVE_LIFECYCLE_SERVICE_RE = re.compile(
     r"^hermes-gateway(?:-[a-z0-9][a-z0-9-]*)?\.service$"
 )
+_NATIVE_DASHBOARD_ACTION = "planned_dashboard_generation_transition"
+_NATIVE_DASHBOARD_SERVICE = "hermes-dashboard-mct.service"
 _NATIVE_LIFECYCLE_CANONICAL_KEY_RE = re.compile(
     r'^\s*\{\s*"native_lifecycle_request"\s*:'
 )
@@ -1401,21 +1408,35 @@ def parse_native_lifecycle_request(
     unknown = sorted(set(raw) - _NATIVE_LIFECYCLE_FIELDS)
     if unknown:
         return None, f"native lifecycle request has unknown field(s): {', '.join(unknown)}"
-    missing = sorted(_NATIVE_LIFECYCLE_FIELDS - set(raw))
+    required = _NATIVE_LIFECYCLE_FIELDS - {"expires_at"}
+    missing = sorted(required - set(raw))
     if missing:
         return None, f"native lifecycle request missing field(s): {', '.join(missing)}"
-    if raw["version"] != 1:
+    if isinstance(raw["version"], bool) or not isinstance(raw["version"], int) or raw["version"] != 1:
         return None, "native lifecycle request version must be 1"
-    if raw["action"] != "planned_gateway_restart":
-        return None, "native lifecycle request action must be planned_gateway_restart"
+    action = raw["action"]
+    if not isinstance(action, str) or action not in {
+        "planned_gateway_restart",
+        _NATIVE_DASHBOARD_ACTION,
+    }:
+        return None, "native lifecycle request action is not allowed"
     nonce = raw["nonce"]
     if not isinstance(nonce, str) or not _NATIVE_LIFECYCLE_NONCE_RE.fullmatch(nonce):
         return None, "native lifecycle request nonce must be 16-128 safe characters"
     if raw["task_id"] != task.id:
         return None, "native lifecycle request task_id must match its carrier task"
     service = raw["target_service"]
-    if not isinstance(service, str) or not _NATIVE_LIFECYCLE_SERVICE_RE.fullmatch(service):
+    gateway_target = (
+        isinstance(service, str)
+        and _NATIVE_LIFECYCLE_SERVICE_RE.fullmatch(service) is not None
+    )
+    if action == "planned_gateway_restart" and not gateway_target:
         return None, "native lifecycle request target_service is not a Hermes gateway unit"
+    if action == _NATIVE_DASHBOARD_ACTION and service != _NATIVE_DASHBOARD_SERVICE:
+        return None, (
+            "planned dashboard generation transition target_service must be "
+            f"{_NATIVE_DASHBOARD_SERVICE}"
+        )
     for name in ("expected_pid", "expected_starttime"):
         value = raw[name]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -1437,6 +1458,15 @@ def parse_native_lifecycle_request(
         )
     if raw["require_board_idle"] is not True:
         return None, "native lifecycle request require_board_idle must be true"
+    expires_at = raw.get("expires_at")
+    if action == _NATIVE_DASHBOARD_ACTION and expires_at is None:
+        return None, "native dashboard lifecycle request missing field(s): expires_at"
+    if expires_at is not None and (
+        isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+        or expires_at <= 0
+    ):
+        return None, "native lifecycle request expires_at must be a positive Unix timestamp"
     return NativeLifecycleRequest(**raw), None
 
 
@@ -5495,6 +5525,51 @@ def heartbeat_claim(
         return False
 
 
+def _pending_native_dashboard_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+) -> Optional[dict[str, Any]]:
+    """Return the durable accepted request if its delivery result is unresolved."""
+    if run_id is None:
+        return None
+    requested = conn.execute(
+        """
+        SELECT payload FROM task_events
+         WHERE task_id = ? AND run_id = ? AND kind = 'lifecycle_restart_requested'
+         ORDER BY id DESC LIMIT 1
+        """,
+        (task_id, run_id),
+    ).fetchone()
+    if requested is None:
+        return None
+    try:
+        payload = json.loads(requested["payload"])
+    except (TypeError, ValueError):
+        return None
+    if payload.get("action") != _NATIVE_DASHBOARD_ACTION:
+        return None
+    completed = conn.execute(
+        """
+        SELECT 1 FROM task_events
+         WHERE task_id = ? AND run_id = ? AND kind = 'lifecycle_delivery_result'
+         LIMIT 1
+        """,
+        (task_id, run_id),
+    ).fetchone()
+    if completed is not None:
+        return None
+    return {
+        "task_id": task_id,
+        "action": payload.get("action"),
+        "nonce": payload.get("nonce"),
+        "run_id": int(run_id),
+        "claim_lock": payload.get("claim_lock"),
+        "target_service": payload.get("target_service"),
+        "expires_at": payload.get("expires_at"),
+    }
+
+
 def release_stale_claims(
     conn: sqlite3.Connection,
     *,
@@ -5529,13 +5604,32 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, current_run_id, claim_lock, worker_pid, claim_expires, "
+        "       last_heartbeat_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
         (now,),
     ).fetchall()
     for row in stale:
+        pending_delivery = _pending_native_dashboard_delivery(
+            conn,
+            row["id"],
+            row["current_run_id"],
+        )
+        if pending_delivery is not None:
+            if finalize_native_lifecycle_delivery(
+                conn,
+                pending_delivery,
+                status="AMBIGUOUS",
+                reason=(
+                    "dashboard delivery claim expired before durable finalization; "
+                    "delivery must not be retried"
+                ),
+                receipt={"recovery": "expired_claim_fail_closed"},
+            ):
+                reclaimed += 1
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -12093,6 +12187,7 @@ def _release_native_lifecycle_claim(
         "action": request.action,
         "nonce": request.nonce,
         "target_service": request.target_service,
+        "expires_at": request.expires_at,
         "run_id": int(task.current_run_id),
         "claim_lock": task.claim_lock,
         "reason": decision.reason,
@@ -12118,32 +12213,170 @@ def _release_native_lifecycle_claim(
             payload,
             run_id=int(task.current_run_id),
         )
-        _end_run(
-            conn,
-            task.id,
-            outcome="lifecycle_restart_requested",
-            status="released",
-            summary=decision.reason,
-            metadata={"nonce": request.nonce, "target_service": request.target_service},
-        )
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status = 'ready', claim_lock = NULL, claim_expires = NULL,
-                   worker_pid = NULL, last_heartbeat_at = NULL
-             WHERE id = ? AND status = 'running' AND claim_lock = ?
-            """,
-            (task.id, task.claim_lock),
-        )
-        if cur.rowcount != 1:
-            raise RuntimeError("native lifecycle request lost claim CAS")
+        hold_claim_for_delivery = request.action == _NATIVE_DASHBOARD_ACTION
+        if not hold_claim_for_delivery:
+            _end_run(
+                conn,
+                task.id,
+                outcome="lifecycle_restart_requested",
+                status="released",
+                summary=decision.reason,
+                metadata={"nonce": request.nonce, "target_service": request.target_service},
+            )
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'ready', claim_lock = NULL, claim_expires = NULL,
+                       worker_pid = NULL, last_heartbeat_at = NULL
+                 WHERE id = ? AND status = 'running' AND claim_lock = ?
+                """,
+                (task.id, task.claim_lock),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("native lifecycle request lost claim CAS")
     return {
         "task_id": task.id,
+        "action": request.action,
         "nonce": request.nonce,
         "run_id": int(task.current_run_id),
         "claim_lock": task.claim_lock,
         "target_service": request.target_service,
+        "expires_at": request.expires_at,
+        "receipt": receipt,
+        "claim_held_for_delivery": request.action == _NATIVE_DASHBOARD_ACTION,
     }
+
+
+def finalize_native_lifecycle_delivery(
+    conn: sqlite3.Connection,
+    accepted: Mapping[str, Any],
+    *,
+    status: str,
+    reason: str,
+    receipt: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Terminalize a dashboard delivery under its exact original claim.
+
+    ``lifecycle_restart_requested`` is the durable at-most-once marker written
+    before actuation.  This finalizer never retries delivery: success releases
+    the carrier for its normal continuation, while rejected or unknown results
+    block it for an operator with the original run/claim/nonce preserved.
+    """
+    if accepted.get("action") != _NATIVE_DASHBOARD_ACTION:
+        return False
+    if status not in {"DELIVERED", "REJECTED", "AMBIGUOUS"}:
+        raise ValueError("native lifecycle delivery status is invalid")
+    task_id = str(accepted.get("task_id") or "")
+    run_id = int(accepted.get("run_id") or 0)
+    claim_lock = str(accepted.get("claim_lock") or "")
+    if not task_id or run_id <= 0 or not claim_lock:
+        return False
+    delivery_receipt = dict(receipt or {})
+    encoded = json.dumps(delivery_receipt, ensure_ascii=False)
+    if len(encoded.encode("utf-8")) > 8192:
+        raise ValueError("native lifecycle delivery receipt exceeds 8192 bytes")
+
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["status"] != "running"
+            or int(current["current_run_id"] or 0) != run_id
+            or current["claim_lock"] != claim_lock
+        ):
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "lifecycle_delivery_result",
+            {
+                "action": accepted["action"],
+                "nonce": accepted["nonce"],
+                "target_service": accepted["target_service"],
+                "claim_lock": claim_lock,
+                "status": status,
+                "reason": reason,
+                "receipt": delivery_receipt,
+            },
+            run_id=run_id,
+        )
+        if status == "DELIVERED":
+            next_status = "ready"
+            run_status = "released"
+            outcome = "lifecycle_delivery_delivered"
+            block_kind = None
+        else:
+            next_status = "blocked"
+            run_status = "blocked"
+            outcome = f"lifecycle_delivery_{status.lower()}"
+            block_kind = "capability"
+        _end_run(
+            conn,
+            task_id,
+            outcome=outcome,
+            status=run_status,
+            summary=reason,
+            metadata={
+                "nonce": accepted["nonce"],
+                "target_service": accepted["target_service"],
+                "delivery_status": status,
+            },
+        )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?, claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL, last_heartbeat_at = NULL, block_kind = ?
+             WHERE id = ? AND status = 'running' AND claim_lock = ?
+            """,
+            (next_status, block_kind, task_id, claim_lock),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("native lifecycle delivery lost claim CAS")
+    return True
+
+
+def native_lifecycle_delivery_claim_current(
+    conn: sqlite3.Connection,
+    accepted: Mapping[str, Any],
+    *,
+    now: Optional[int] = None,
+) -> bool:
+    """Re-read the exact dashboard claim and expiry immediately before actuation."""
+    if accepted.get("action") != _NATIVE_DASHBOARD_ACTION:
+        return False
+    task_id = str(accepted.get("task_id") or "")
+    run_id = int(accepted.get("run_id") or 0)
+    claim_lock = str(accepted.get("claim_lock") or "")
+    expires_at = accepted.get("expires_at")
+    current_time = int(time.time()) if now is None else int(now)
+    if (
+        not task_id
+        or run_id <= 0
+        or not claim_lock
+        or isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+        or expires_at <= current_time
+    ):
+        return False
+    current = conn.execute(
+        "SELECT status, current_run_id, claim_lock, claim_expires FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return bool(
+        current is not None
+        and current["status"] == "running"
+        and int(current["current_run_id"] or 0) == run_id
+        and current["claim_lock"] == claim_lock
+        and current["claim_expires"] is not None
+        and expires_at <= int(current["claim_expires"])
+        and _native_lifecycle_request_consumed(
+            conn, task_id, str(accepted.get("nonce") or "")
+        )
+    )
 
 
 def _dispatch_native_lifecycle_request(

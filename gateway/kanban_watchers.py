@@ -11,11 +11,14 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import signal
 import sqlite3
+import subprocess
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -24,6 +27,41 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+_DASHBOARD_ACTION = "planned_dashboard_generation_transition"
+_DASHBOARD_SERVICE = "hermes-dashboard-mct.service"
+_DASHBOARD_SYSTEMCTL_ARGV = (
+    "/usr/bin/systemctl",
+    "restart",
+    "hermes-dashboard-mct.service",
+)
+_DASHBOARD_ROLLBACK_REF = "refs/aion/rollback/t_2066e6dc-pr44-run3246"
+_DASHBOARD_ROLLBACK_COMMIT = "8ee027291dc209f2271e32c2a1d4f2ac823c4953"
+_DASHBOARD_ROLLBACK_TREE = "d1554f791fde1ea87d1346b0bdcf2d9a95a77348"
+_DASHBOARD_PR44_COMMIT = "ec7fee2a40af239629d96f35e4f81db8f8a6c38f"
+_DASHBOARD_PR44_TREE = "065877c0888bef9da3cd1961ec22d06e8ba232ad"
+_DASHBOARD_FRAGMENT = Path("/etc/systemd/system/hermes-dashboard-mct.service")
+_DASHBOARD_DROPINS = {
+    Path("/etc/systemd/system/hermes-dashboard-mct.service.d/zz-aion-pilot24.conf"):
+        "ef67bc35eed6e50d7e0967ac19e3550b94ae17b39c4d6cfc69cb06fd62e90d95",
+    Path("/etc/systemd/system/hermes-dashboard-mct.service.d/zz-mct-live-read.conf"):
+        "308981726a25a6c476dea270a1c1cf4e0a3a29833582f06c0db8909c88e7f3c4",
+    Path("/etc/systemd/system/hermes-dashboard-mct.service.d/zzz-aion-main-2236f7a0.conf"):
+        "1c779f47a4e0a139fbe27dde994bce43647fb580009a49236cffafd946cb97ef",
+}
+_DASHBOARD_FRAGMENT_SHA256 = (
+    "176408ab5575d7482bc97789ede47e1b7f7179bda2040a0cb340cece034f042c"
+)
+_DASHBOARD_EXEC_ARGV = (
+    "/usr/local/lib/hermes-agent-main-venv/bin/hermes --profile gm2 dashboard "
+    "--host 127.0.0.1 --port 19119 --skip-build --no-open --isolated"
+)
+_DASHBOARD_ROLLBACK_FILES = {
+    "hermes_cli/kanban_db.py",
+    "plugins/kanban/dashboard/plugin_api.py",
+    "tests/hermes_cli/test_kanban_core_functionality.py",
+    "tests/plugins/test_kanban_dashboard_plugin.py",
+}
 
 
 def _read_self_cgroup() -> Optional[str]:
@@ -39,6 +77,160 @@ def _read_self_cgroup() -> Optional[str]:
     return None
 
 
+def _read_proc_starttime(pid: int) -> Optional[int]:
+    """Read Linux ``/proc/<pid>/stat`` field 22 without trusting ``comm`` spacing."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    after = data.rfind(")")
+    if after < 0:
+        return None
+    fields = data[after + 2 :].split()
+    try:
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _read_dashboard_service_identity(*, run_fn=subprocess.run) -> dict[str, Any]:
+    """Freshly read the one literal dashboard unit and its resident process."""
+    argv = [
+            "/usr/bin/systemctl",
+            "show",
+            "hermes-dashboard-mct.service",
+            "--property=MainPID",
+            "--property=InvocationID",
+            "--property=ControlGroup",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=NeedDaemonReload",
+            "--property=FragmentPath",
+            "--property=DropInPaths",
+            "--property=ExecStart",
+        ]
+
+    def show() -> dict[str, str]:
+        completed = run_fn(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"dashboard identity read failed with exit {completed.returncode}"
+            )
+        result = {}
+        for line in completed.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                result[key] = value
+        return result
+
+    values = show()
+    try:
+        pid = int(values["MainPID"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("dashboard identity has invalid MainPID") from exc
+    starttime = _read_proc_starttime(pid)
+    if pid <= 0 or starttime is None:
+        raise RuntimeError("dashboard resident process identity is unavailable")
+    # A restart between ``systemctl show`` and /proc would otherwise create a
+    # mixed identity from two generations.  Re-read the complete unit snapshot
+    # and accept only byte-identical properties around the /proc observation.
+    if show() != values:
+        raise RuntimeError("dashboard identity changed during fresh read")
+    fragment = Path(values.get("FragmentPath", ""))
+    dropins = tuple(Path(item) for item in values.get("DropInPaths", "").split())
+    if fragment != _DASHBOARD_FRAGMENT or set(dropins) != set(_DASHBOARD_DROPINS):
+        raise RuntimeError("dashboard loaded unit/drop-in paths mismatch")
+    try:
+        loaded_hashes = {
+            str(fragment): hashlib.sha256(fragment.read_bytes()).hexdigest(),
+            **{
+                str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in dropins
+            },
+        }
+    except OSError as exc:
+        raise RuntimeError("dashboard loaded unit/drop-in bytes are unavailable") from exc
+    expected_hashes = {
+        str(_DASHBOARD_FRAGMENT): _DASHBOARD_FRAGMENT_SHA256,
+        **{str(path): digest for path, digest in _DASHBOARD_DROPINS.items()},
+    }
+    if loaded_hashes != expected_hashes:
+        raise RuntimeError("dashboard loaded unit/drop-in hash mismatch")
+    exec_start = values.get("ExecStart", "")
+    if f"argv[]={_DASHBOARD_EXEC_ARGV} ;" not in exec_start:
+        raise RuntimeError("dashboard loaded ExecStart mismatch")
+    return {
+        "actual_pid": pid,
+        "actual_starttime": starttime,
+        "actual_invocation_id": values.get("InvocationID", ""),
+        "actual_service": _DASHBOARD_SERVICE,
+        "actual_cgroup": values.get("ControlGroup", ""),
+        "active_state": values.get("ActiveState", ""),
+        "sub_state": values.get("SubState", ""),
+        "need_daemon_reload": values.get("NeedDaemonReload", ""),
+        "fragment_path": str(fragment),
+        "dropin_paths": [str(path) for path in dropins],
+        "loaded_hashes": loaded_hashes,
+        "loaded_exec_argv": _DASHBOARD_EXEC_ARGV,
+    }
+
+
+def _verify_dashboard_rollback_readiness(*, run_fn=subprocess.run) -> dict[str, Any]:
+    """Verify the fixed PR44 rollback ref in this exact source checkout."""
+    source_root = Path(__file__).resolve().parents[1]
+
+    def git(*args: str) -> str:
+        completed = run_fn(
+            ["git", "-C", str(source_root), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"rollback git read failed: {' '.join(args)}")
+        return completed.stdout.strip()
+
+    rollback_commit = git("rev-parse", _DASHBOARD_ROLLBACK_REF)
+    rollback_tree = git("rev-parse", f"{_DASHBOARD_ROLLBACK_REF}^{{tree}}")
+    if rollback_commit != _DASHBOARD_ROLLBACK_COMMIT:
+        raise RuntimeError("dashboard rollback commit mismatch")
+    if rollback_tree != _DASHBOARD_ROLLBACK_TREE:
+        raise RuntimeError("dashboard rollback tree mismatch")
+    if git("rev-parse", f"{_DASHBOARD_PR44_COMMIT}^{{tree}}") != _DASHBOARD_PR44_TREE:
+        raise RuntimeError("dashboard PR44 roll-forward tree mismatch")
+    changed_files = set(
+        git(
+            "diff",
+            "--name-only",
+            f"{_DASHBOARD_ROLLBACK_REF}..{_DASHBOARD_PR44_COMMIT}",
+        ).splitlines()
+    )
+    if changed_files != _DASHBOARD_ROLLBACK_FILES:
+        raise RuntimeError("dashboard rollback install manifest mismatch")
+    git("merge-base", "--is-ancestor", _DASHBOARD_ROLLBACK_REF, _DASHBOARD_PR44_COMMIT)
+    git("merge-base", "--is-ancestor", _DASHBOARD_PR44_COMMIT, "HEAD")
+    if git("status", "--porcelain"):
+        raise RuntimeError("dashboard source checkout is dirty")
+    return {
+        "rollback_ref": _DASHBOARD_ROLLBACK_REF,
+        "rollback_commit": rollback_commit,
+        "rollback_tree": rollback_tree,
+        "source_head": git("rev-parse", "HEAD"),
+        "source_tree": git("rev-parse", "HEAD^{tree}"),
+        "source_clean": True,
+        "rollback_files": sorted(changed_files),
+        "rollforward_commit": _DASHBOARD_PR44_COMMIT,
+        "rollforward_tree": _DASHBOARD_PR44_TREE,
+    }
+
+
 def _evaluate_native_lifecycle_restart_request(
     task,
     request,
@@ -48,21 +240,96 @@ def _evaluate_native_lifecycle_restart_request(
     current_invocation_id: Optional[str] = None,
     current_service: Optional[str] = None,
     current_cgroup: Optional[str] = None,
+    now: Optional[int] = None,
+    dashboard_identity_fn=_read_dashboard_service_identity,
+    rollback_ready_fn=_verify_dashboard_rollback_readiness,
 ):
-    """Bind one Native request to this exact claimed gateway generation."""
+    """Bind one Native request to its fresh exact runtime and claim generation."""
     from hermes_cli import kanban_db as _kb
     from hermes_cli.gateway import get_service_name
 
-    if current_pid is None:
-        current_pid = os.getpid()
-    if current_starttime is None:
-        current_starttime = _kb._process_starttime()
-    if current_invocation_id is None:
-        current_invocation_id = os.environ.get("INVOCATION_ID", "")
-    if current_service is None:
-        current_service = f"{get_service_name()}.service"
-    if current_cgroup is None:
-        current_cgroup = _read_self_cgroup()
+    if task.id != request.task_id:
+        return _kb.NativeLifecycleDecision(False, "task_id provenance mismatch", {})
+    if (
+        task.current_run_id is None
+        or not task.claim_lock
+        or task.claim_expires is None
+    ):
+        return _kb.NativeLifecycleDecision(False, "claim provenance is unbound", {})
+    now = int(time.time()) if now is None else int(now)
+    if request.action == _DASHBOARD_ACTION and request.expires_at is None:
+        return _kb.NativeLifecycleDecision(False, "native lifecycle request expiry is missing", {})
+    if request.expires_at is not None and request.expires_at <= now:
+        return _kb.NativeLifecycleDecision(False, "native lifecycle request expired", {})
+    if request.expires_at is not None and request.expires_at > int(task.claim_expires):
+        return _kb.NativeLifecycleDecision(
+            False,
+            "native lifecycle request expiry exceeds its claim lease",
+            {},
+        )
+
+    explicit_identity = any(
+        value is not None
+        for value in (
+            current_pid,
+            current_starttime,
+            current_invocation_id,
+            current_service,
+            current_cgroup,
+        )
+    )
+    rollback_receipt = {}
+    identity_receipt = {}
+    if request.action == _DASHBOARD_ACTION and not explicit_identity:
+        try:
+            identity = dashboard_identity_fn()
+        except Exception as exc:
+            return _kb.NativeLifecycleDecision(
+                False,
+                f"dashboard identity read failed: {type(exc).__name__}",
+                {},
+            )
+        current_pid = identity.get("actual_pid")
+        current_starttime = identity.get("actual_starttime")
+        current_invocation_id = identity.get("actual_invocation_id")
+        current_service = identity.get("actual_service")
+        current_cgroup = identity.get("actual_cgroup")
+        identity_receipt = {
+            name: identity.get(name)
+            for name in (
+                "fragment_path",
+                "dropin_paths",
+                "loaded_hashes",
+                "loaded_exec_argv",
+            )
+        }
+        if identity.get("active_state") != "active" or identity.get("sub_state") != "running":
+            return _kb.NativeLifecycleDecision(
+                False, "dashboard target is not active/running", identity
+            )
+        if identity.get("need_daemon_reload") not in {"no", False, None}:
+            return _kb.NativeLifecycleDecision(
+                False, "dashboard target requires daemon reload", identity
+            )
+        try:
+            rollback_receipt = rollback_ready_fn()
+        except Exception as exc:
+            return _kb.NativeLifecycleDecision(
+                False,
+                f"dashboard rollback readiness failed: {type(exc).__name__}",
+                identity,
+            )
+    else:
+        if current_pid is None:
+            current_pid = os.getpid()
+        if current_starttime is None:
+            current_starttime = _kb._process_starttime()
+        if current_invocation_id is None:
+            current_invocation_id = os.environ.get("INVOCATION_ID", "")
+        if current_service is None:
+            current_service = f"{get_service_name()}.service"
+        if current_cgroup is None:
+            current_cgroup = _read_self_cgroup()
 
     receipt = {
         "actual_pid": current_pid,
@@ -70,11 +337,11 @@ def _evaluate_native_lifecycle_restart_request(
         "actual_invocation_id": current_invocation_id,
         "actual_service": current_service,
         "actual_cgroup": current_cgroup,
+        "expires_at": request.expires_at,
+        "claim_expires": int(task.claim_expires),
     }
-    if task.id != request.task_id:
-        return _kb.NativeLifecycleDecision(False, "task_id provenance mismatch", receipt)
-    if task.current_run_id is None or not task.claim_lock:
-        return _kb.NativeLifecycleDecision(False, "claim provenance is unbound", receipt)
+    receipt.update(identity_receipt)
+    receipt.update(rollback_receipt)
     comparisons = (
         ("target_service", request.target_service, current_service),
         ("expected_pid", request.expected_pid, current_pid),
@@ -93,7 +360,9 @@ def _evaluate_native_lifecycle_restart_request(
                 f"{name} mismatch: expected {expected!r}, actual {actual!r}",
                 receipt,
             )
-    return _kb.NativeLifecycleDecision(True, "exact runtime identity matched", receipt)
+    return _kb.NativeLifecycleDecision(
+        True, "exact runtime identity and rollback readiness matched", receipt
+    )
 
 
 def _dispatch_native_lifecycle_restart_signal(
@@ -104,7 +373,11 @@ def _dispatch_native_lifecycle_restart_signal(
 ) -> bool:
     """Deliver one accepted request through the existing SIGUSR1 path."""
     sigusr1 = getattr(signal, "SIGUSR1", None)
-    if len(accepted_requests) != 1 or sigusr1 is None:
+    if (
+        len(accepted_requests) != 1
+        or accepted_requests[0].get("action") != "planned_gateway_restart"
+        or sigusr1 is None
+    ):
         return False
     try:
         kill_fn(current_pid if current_pid is not None else os.getpid(), sigusr1)
@@ -112,6 +385,141 @@ def _dispatch_native_lifecycle_restart_signal(
         logger.exception("Failed to deliver accepted Native lifecycle request")
         return False
     return True
+
+
+@dataclass(frozen=True)
+class NativeLifecycleDelivery:
+    status: str
+    reason: str
+    receipt: dict[str, Any] = field(default_factory=dict)
+
+
+def _dispatch_native_lifecycle_action(
+    accepted_requests,
+    *,
+    kill_fn=os.kill,
+    current_pid: Optional[int] = None,
+    run_fn=subprocess.run,
+    dashboard_identity_fn=_read_dashboard_service_identity,
+    rollback_ready_fn=_verify_dashboard_rollback_readiness,
+    pre_delivery_guard=lambda: True,
+) -> NativeLifecycleDelivery:
+    """Deliver exactly one pre-accepted literal action without shell interpolation."""
+    if len(accepted_requests) != 1:
+        return NativeLifecycleDelivery("REJECTED", "expected exactly one accepted request")
+    accepted = accepted_requests[0]
+    action = accepted.get("action")
+    if action == "planned_gateway_restart":
+        if _dispatch_native_lifecycle_restart_signal(
+            accepted_requests, kill_fn=kill_fn, current_pid=current_pid
+        ):
+            return NativeLifecycleDelivery("DELIVERED", "SIGUSR1 delivered to exact gateway")
+        return NativeLifecycleDelivery("REJECTED", "gateway SIGUSR1 delivery failed")
+    if action != _DASHBOARD_ACTION or accepted.get("target_service") != _DASHBOARD_SERVICE:
+        return NativeLifecycleDelivery("REJECTED", "action/target pair is not allowed")
+
+    old = dict(accepted.get("receipt") or {})
+    identity_keys = (
+        "actual_pid",
+        "actual_starttime",
+        "actual_invocation_id",
+        "actual_service",
+        "actual_cgroup",
+        "fragment_path",
+        "dropin_paths",
+        "loaded_hashes",
+        "loaded_exec_argv",
+    )
+    try:
+        pre = dashboard_identity_fn()
+    except Exception as exc:
+        return NativeLifecycleDelivery(
+            "REJECTED",
+            "dashboard identity could not be re-read immediately before delivery",
+            {"error_type": type(exc).__name__},
+        )
+    precondition_ok = (
+        all(name in old and name in pre and old[name] == pre[name] for name in identity_keys)
+        and pre.get("active_state") == "active"
+        and pre.get("sub_state") == "running"
+        and pre.get("need_daemon_reload") == "no"
+    )
+    if not precondition_ok:
+        return NativeLifecycleDelivery(
+            "REJECTED",
+            "dashboard identity or loaded configuration changed before delivery",
+            pre,
+        )
+
+    # Rollback and claim freshness are actuation-time preconditions, not only
+    # request-acceptance checks.  Perform both after the potentially slow
+    # identity read and immediately before the one literal invocation.
+    try:
+        rollback = rollback_ready_fn()
+    except Exception as exc:
+        return NativeLifecycleDelivery(
+            "REJECTED",
+            "dashboard rollback readiness changed before delivery",
+            {"error_type": type(exc).__name__},
+        )
+    if not pre_delivery_guard():
+        return NativeLifecycleDelivery(
+            "REJECTED",
+            "dashboard delivery claim or expiry changed before actuation",
+            rollback,
+        )
+
+    try:
+        completed = run_fn(list(_DASHBOARD_SYSTEMCTL_ARGV), check=False, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        return NativeLifecycleDelivery(
+            "AMBIGUOUS",
+            "dashboard restart timed out; completion is unknown and must not be retried",
+            {"timeout_seconds": exc.timeout},
+        )
+    except OSError as exc:
+        return NativeLifecycleDelivery(
+            "REJECTED",
+            "dashboard restart could not be executed",
+            {"error_type": type(exc).__name__},
+        )
+    if completed.returncode != 0:
+        return NativeLifecycleDelivery(
+            "REJECTED",
+            f"dashboard restart exited nonzero ({completed.returncode})",
+            {"returncode": completed.returncode},
+        )
+
+    try:
+        post = dashboard_identity_fn()
+    except Exception as exc:
+        return NativeLifecycleDelivery(
+            "AMBIGUOUS",
+            "dashboard restart exited zero but postcondition identity is unknown",
+            {"error_type": type(exc).__name__},
+        )
+    changed = all(
+        post.get(name) not in {None, "", old.get(name)}
+        for name in ("actual_pid", "actual_starttime", "actual_invocation_id")
+    )
+    postcondition_ok = (
+        changed
+        and post.get("actual_service") == _DASHBOARD_SERVICE
+        and post.get("actual_cgroup") == f"/system.slice/{_DASHBOARD_SERVICE}"
+        and post.get("active_state") == "active"
+        and post.get("sub_state") == "running"
+    )
+    if not postcondition_ok:
+        return NativeLifecycleDelivery(
+            "AMBIGUOUS",
+            "dashboard restart exited zero but exact new resident postcondition failed",
+            post,
+        )
+    return NativeLifecycleDelivery(
+        "DELIVERED",
+        "literal dashboard restart delivered with fresh resident readback",
+        post,
+    )
 
 
 def _resolve_auto_decompose_settings(
@@ -1537,25 +1945,80 @@ class GatewayKanbanWatchersMixin:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
                 lifecycle_requests = [
-                    request
-                    for _slug, dispatch_result in (results or [])
+                    (slug, request)
+                    for slug, dispatch_result in (results or [])
                     if dispatch_result is not None
                     for request in (
                         getattr(dispatch_result, "lifecycle_restart_requests", None)
                         or []
                     )
                 ]
-                if lifecycle_requests:
-                    request = lifecycle_requests[0]
+                if len(lifecycle_requests) > 1:
+                    logger.error(
+                        "kanban dispatcher: refusing %d simultaneous Native lifecycle "
+                        "requests; no action was delivered",
+                        len(lifecycle_requests),
+                    )
+                    # Dashboard claims remain held until a durable delivery
+                    # result exists.  Terminalize every colliding dashboard
+                    # request as rejected; legacy gateway requests retain the
+                    # existing no-signal/no-retry behavior.
+                    for collision_slug, collision_request in lifecycle_requests:
+                        if collision_request.get("action") != _DASHBOARD_ACTION:
+                            continue
+                        collision_conn = _kb.connect(board=collision_slug)
+                        try:
+                            _kb.finalize_native_lifecycle_delivery(
+                                collision_conn,
+                                collision_request,
+                                status="REJECTED",
+                                reason=(
+                                    "multiple simultaneous Native lifecycle requests; "
+                                    "no action was delivered"
+                                ),
+                            )
+                        finally:
+                            collision_conn.close()
+                elif lifecycle_requests:
+                    slug, request = lifecycle_requests[0]
                     logger.warning(
                         "kanban dispatcher: delivering accepted Native lifecycle "
-                        "request task=%s nonce=%s through SIGUSR1",
+                        "request task=%s nonce=%s action=%s",
                         request.get("task_id"),
                         request.get("nonce"),
+                        request.get("action"),
                     )
-                    if not _dispatch_native_lifecycle_restart_signal(
-                        lifecycle_requests
-                    ):
+                    if request.get("action") == _DASHBOARD_ACTION:
+                        def _claim_still_current():
+                            guard_conn = _kb.connect(board=slug)
+                            try:
+                                return _kb.native_lifecycle_delivery_claim_current(
+                                    guard_conn, request
+                                )
+                            finally:
+                                guard_conn.close()
+
+                        conn = _kb.connect(board=slug)
+                        try:
+                            delivery = await asyncio.to_thread(
+                                _dispatch_native_lifecycle_action,
+                                [request],
+                                pre_delivery_guard=_claim_still_current,
+                            )
+                            finalized = _kb.finalize_native_lifecycle_delivery(
+                                conn,
+                                request,
+                                status=delivery.status,
+                                reason=delivery.reason,
+                                receipt=delivery.receipt,
+                            )
+                        finally:
+                            conn.close()
+                        if not finalized:
+                            logger.error(
+                                "kanban dispatcher: dashboard delivery result lost exact claim CAS"
+                            )
+                    elif not _dispatch_native_lifecycle_restart_signal([request]):
                         logger.error(
                             "kanban dispatcher: accepted Native lifecycle request "
                             "could not be delivered; task will continue without retry"

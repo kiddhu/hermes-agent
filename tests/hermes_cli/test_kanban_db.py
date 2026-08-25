@@ -2217,20 +2217,28 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
 # Dispatcher
 # ---------------------------------------------------------------------------
 
-def _native_lifecycle_request_body(task_id: str, *, nonce: str = "restart-request-0001") -> str:
+def _native_lifecycle_request_body(
+    task_id: str,
+    *,
+    nonce: str = "restart-request-0001",
+    action: str = "planned_gateway_restart",
+    target_service: str = "hermes-gateway-gm2.service",
+    expires_at: int | None = None,
+) -> str:
     return json.dumps(
         {
             "native_lifecycle_request": {
                 "version": 1,
-                "action": "planned_gateway_restart",
+                "action": action,
                 "nonce": nonce,
                 "task_id": task_id,
-                "target_service": "hermes-gateway-gm2.service",
+                "target_service": target_service,
                 "expected_pid": 4242,
                 "expected_starttime": 98765,
                 "expected_invocation_id": "invocation-123",
-                "expected_cgroup": "/system.slice/hermes-gateway-gm2.service",
+                "expected_cgroup": f"/system.slice/{target_service}",
                 "require_board_idle": True,
+                "expires_at": expires_at or int(time.time()) + 120,
             }
         }
     )
@@ -2340,6 +2348,148 @@ def test_dispatch_native_lifecycle_request_nonce_is_consumed_at_most_once(
     assert len([e for e in events if e.kind == "lifecycle_restart_requested"]) == 1
 
 
+@pytest.mark.parametrize(
+    "delivery_status, expected_task_status, expected_run_status",
+    [
+        ("DELIVERED", "ready", "released"),
+        ("REJECTED", "blocked", "blocked"),
+        ("AMBIGUOUS", "blocked", "blocked"),
+    ],
+)
+def test_dashboard_lifecycle_delivery_holds_exact_claim_and_terminalizes_once(
+    kanban_home,
+    all_assignees_spawnable,
+    delivery_status,
+    expected_task_status,
+    expected_run_status,
+):
+    def evaluate(task, request):
+        return kb.NativeLifecycleDecision(
+            True,
+            "exact dashboard generation and rollback matched",
+            {"actual_pid": 4242, "actual_starttime": 98765},
+        )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="restart dashboard", assignee="agent007")
+        _set_task_body(
+            conn,
+            task_id,
+            _native_lifecycle_request_body(
+                task_id,
+                action="planned_dashboard_generation_transition",
+                target_service="hermes-dashboard-mct.service",
+            ),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_: pytest.fail("dashboard lifecycle carrier must not spawn"),
+            lifecycle_request_fn=evaluate,
+        )
+        assert len(result.lifecycle_restart_requests) == 1
+        accepted = result.lifecycle_restart_requests[0]
+        held = kb.get_task(conn, task_id)
+        assert held is not None and held.status == "running"
+        assert held.current_run_id == accepted["run_id"]
+        assert held.claim_lock == accepted["claim_lock"]
+        assert kb.native_lifecycle_delivery_claim_current(conn, accepted)
+
+        assert kb.finalize_native_lifecycle_delivery(
+            conn,
+            accepted,
+            status=delivery_status,
+            reason=f"delivery result {delivery_status}",
+            receipt={"readback": delivery_status.lower()},
+        )
+        assert not kb.finalize_native_lifecycle_delivery(
+            conn,
+            accepted,
+            status=delivery_status,
+            reason="replay",
+        )
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert task is not None and task.status == expected_task_status
+    assert task.claim_lock is None and task.current_run_id is None
+    assert run is not None and run.status == expected_run_status
+    delivery_events = [e for e in events if e.kind == "lifecycle_delivery_result"]
+    assert len(delivery_events) == 1
+    assert delivery_events[0].payload is not None
+    assert delivery_events[0].payload["status"] == delivery_status
+
+
+def test_dashboard_lifecycle_pre_delivery_guard_rejects_claim_or_expiry_drift(
+    kanban_home,
+    all_assignees_spawnable,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="restart dashboard", assignee="agent007")
+        _set_task_body(
+            conn,
+            task_id,
+            _native_lifecycle_request_body(
+                task_id,
+                action="planned_dashboard_generation_transition",
+                target_service="hermes-dashboard-mct.service",
+            ),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_: None,
+            lifecycle_request_fn=lambda *_: kb.NativeLifecycleDecision(True, "matched", {}),
+        )
+        accepted = result.lifecycle_restart_requests[0]
+        wrong_claim = {**accepted, "claim_lock": "different-claim"}
+
+        assert not kb.native_lifecycle_delivery_claim_current(conn, wrong_claim)
+        assert not kb.native_lifecycle_delivery_claim_current(
+            conn,
+            accepted,
+            now=int(accepted["expires_at"]),
+        )
+
+
+def test_stale_dashboard_delivery_claim_blocks_as_ambiguous_without_retry(
+    kanban_home,
+    all_assignees_spawnable,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="restart dashboard", assignee="agent007")
+        _set_task_body(
+            conn,
+            task_id,
+            _native_lifecycle_request_body(
+                task_id,
+                action="planned_dashboard_generation_transition",
+                target_service="hermes-dashboard-mct.service",
+            ),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_: None,
+            lifecycle_request_fn=lambda *_: kb.NativeLifecycleDecision(True, "matched", {}),
+        )
+        assert len(result.lifecycle_restart_requests) == 1
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, task_id),
+        )
+
+        assert kb.release_stale_claims(conn) == 1
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert task is not None and task.status == "blocked"
+    assert task.block_kind == "capability"
+    delivery_events = [e for e in events if e.kind == "lifecycle_delivery_result"]
+    assert len(delivery_events) == 1
+    assert delivery_events[0].payload is not None
+    assert delivery_events[0].payload["status"] == "AMBIGUOUS"
+    assert "must not be retried" in delivery_events[0].payload["reason"]
+
+
 def test_dispatch_native_lifecycle_request_defers_until_board_is_idle(
     kanban_home, all_assignees_spawnable
 ):
@@ -2367,6 +2517,8 @@ def test_dispatch_native_lifecycle_request_defers_until_board_is_idle(
         ({"nonce": "short"}, "nonce"),
         ({"task_id": "t_deadbeef"}, "task_id"),
         ({"action": "restart_any_service"}, "action"),
+        ({"action": []}, "action"),
+        ({"version": True}, "version"),
         ({"require_board_idle": False}, "require_board_idle"),
         ({"unexpected": "field"}, "unknown field"),
     ],

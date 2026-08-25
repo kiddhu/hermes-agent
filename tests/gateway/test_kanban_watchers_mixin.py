@@ -8,14 +8,18 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 from __future__ import annotations
 
 import inspect
+import hashlib
 import json
 import os
 import signal
+import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import gateway.kanban_watchers as kanban_watchers
 from gateway.kanban_watchers import (
     GatewayKanbanWatchersMixin,
     _dispatch_native_lifecycle_restart_signal,
@@ -95,16 +99,23 @@ def _request(**overrides):
         "expected_invocation_id": "invocation-123",
         "expected_cgroup": "/system.slice/hermes-gateway-gm2.service",
         "require_board_idle": True,
+        "expires_at": int(time.time()) + 120,
     }
     values.update(overrides)
     return NativeLifecycleRequest(**values)
 
 
 def test_native_lifecycle_request_accepts_exact_gateway_generation():
-    task = SimpleNamespace(id="t_1234abcd", current_run_id=73, claim_lock="claim-73")
+    task = SimpleNamespace(
+        id="t_1234abcd",
+        current_run_id=73,
+        claim_lock="claim-73",
+        claim_expires=int(time.time()) + 300,
+    )
+    request = _request()
     decision = _evaluate_native_lifecycle_restart_request(
         task,
-        _request(),
+        request,
         current_pid=4242,
         current_starttime=98765,
         current_invocation_id="invocation-123",
@@ -119,6 +130,8 @@ def test_native_lifecycle_request_accepts_exact_gateway_generation():
         "actual_invocation_id": "invocation-123",
         "actual_service": "hermes-gateway-gm2.service",
         "actual_cgroup": "/system.slice/hermes-gateway-gm2.service",
+        "expires_at": request.expires_at,
+        "claim_expires": task.claim_expires,
     }
 
 
@@ -133,7 +146,12 @@ def test_native_lifecycle_request_accepts_exact_gateway_generation():
     ],
 )
 def test_native_lifecycle_request_rejects_generation_or_target_drift(actuals, reason):
-    task = SimpleNamespace(id="t_1234abcd", current_run_id=73, claim_lock="claim-73")
+    task = SimpleNamespace(
+        id="t_1234abcd",
+        current_run_id=73,
+        claim_lock="claim-73",
+        claim_expires=int(time.time()) + 300,
+    )
     runtime = {
         "current_pid": 4242,
         "current_starttime": 98765,
@@ -150,7 +168,12 @@ def test_native_lifecycle_request_rejects_generation_or_target_drift(actuals, re
 
 
 def test_native_lifecycle_request_rejects_unbound_claim_provenance():
-    task = SimpleNamespace(id="t_1234abcd", current_run_id=None, claim_lock=None)
+    task = SimpleNamespace(
+        id="t_1234abcd",
+        current_run_id=None,
+        claim_lock=None,
+        claim_expires=None,
+    )
     decision = _evaluate_native_lifecycle_restart_request(
         task,
         _request(),
@@ -168,7 +191,14 @@ def test_native_lifecycle_request_rejects_unbound_claim_provenance():
 @pytest.mark.skipif(SIGUSR1 is None, reason="SIGUSR1 is POSIX-only")
 def test_dispatch_native_lifecycle_restart_signal_uses_existing_sigusr1_path():
     calls = []
-    accepted = [{"task_id": "t_1234abcd", "nonce": "restart-request-0001"}]
+    accepted = [
+        {
+            "action": "planned_gateway_restart",
+            "task_id": "t_1234abcd",
+            "nonce": "restart-request-0001",
+            "target_service": "hermes-gateway-gm2.service",
+        }
+    ]
 
     assert _dispatch_native_lifecycle_restart_signal(
         accepted,
@@ -185,6 +215,386 @@ def test_dispatch_native_lifecycle_restart_signal_fails_closed_without_exact_sin
         [{"task_id": "a"}, {"task_id": "b"}],
         kill_fn=lambda *args: calls.append(args),
     )
+    assert calls == []
+
+
+def _dashboard_request_body(task_id: str, **overrides) -> str:
+    request = {
+        "version": 1,
+        "action": "planned_dashboard_generation_transition",
+        "nonce": "dashboard-request-0001",
+        "task_id": task_id,
+        "target_service": "hermes-dashboard-mct.service",
+        "expected_pid": 4242,
+        "expected_starttime": 98765,
+        "expected_invocation_id": "dashboard-invocation-123",
+        "expected_cgroup": "/system.slice/hermes-dashboard-mct.service",
+        "require_board_idle": True,
+        "expires_at": int(time.time()) + 120,
+    }
+    request.update(overrides)
+    return json.dumps({"native_lifecycle_request": request})
+
+
+def test_native_lifecycle_parser_accepts_only_exact_dashboard_action_target_with_expiry():
+    from hermes_cli import kanban_db as kb
+
+    task = SimpleNamespace(id="t_1234abcd", body=_dashboard_request_body("t_1234abcd"))
+    request, error = kb.parse_native_lifecycle_request(task)
+
+    assert error is None
+    assert request is not None
+    assert request.action == "planned_dashboard_generation_transition"
+    assert request.target_service == "hermes-dashboard-mct.service"
+    assert request.expires_at is not None
+    assert request.expires_at > int(time.time())
+
+
+def test_native_lifecycle_parser_rejects_dashboard_request_without_expiry():
+    from hermes_cli import kanban_db as kb
+
+    raw = json.loads(_dashboard_request_body("t_1234abcd"))
+    raw["native_lifecycle_request"].pop("expires_at")
+    request, error = kb.parse_native_lifecycle_request(
+        SimpleNamespace(id="t_1234abcd", body=json.dumps(raw))
+    )
+
+    assert request is None
+    assert error is not None and "expires_at" in error
+
+
+def test_native_lifecycle_parser_preserves_legacy_gateway_request_without_expiry():
+    from hermes_cli import kanban_db as kb
+
+    request_dict = _request().__dict__.copy()
+    request_dict.pop("expires_at")
+    body = json.dumps({"native_lifecycle_request": request_dict})
+    request, error = kb.parse_native_lifecycle_request(
+        SimpleNamespace(id="t_1234abcd", body=body)
+    )
+
+    assert error is None
+    assert request is not None
+    assert request.action == "planned_gateway_restart"
+    assert request.expires_at is None
+
+
+@pytest.mark.parametrize(
+    "overrides, reason",
+    [
+        ({"target_service": "hermes-gateway-gm2.service"}, "target_service"),
+        ({"action": "planned_gateway_restart"}, "gateway unit"),
+        ({"action": "restart_any_service"}, "action"),
+    ],
+)
+def test_dashboard_parser_rejects_wrong_action_target_pairs(overrides, reason):
+    from hermes_cli import kanban_db as kb
+
+    task = SimpleNamespace(
+        id="t_1234abcd",
+        body=_dashboard_request_body("t_1234abcd", **overrides),
+    )
+    request, error = kb.parse_native_lifecycle_request(task)
+
+    assert request is None
+    assert error is not None and reason in error
+
+
+def _dashboard_identity(**overrides):
+    identity = {
+        "actual_pid": 4242,
+        "actual_starttime": 98765,
+        "actual_invocation_id": "dashboard-invocation-123",
+        "actual_service": "hermes-dashboard-mct.service",
+        "actual_cgroup": "/system.slice/hermes-dashboard-mct.service",
+        "active_state": "active",
+        "sub_state": "running",
+        "need_daemon_reload": "no",
+        "fragment_path": "/etc/systemd/system/hermes-dashboard-mct.service",
+        "dropin_paths": ["dropin-a", "dropin-b", "dropin-c"],
+        "loaded_hashes": {"fragment": "sha256-a"},
+        "loaded_exec_argv": "fixed-dashboard-exec",
+    }
+    identity.update(overrides)
+    return identity
+
+
+def test_dashboard_identity_binds_loaded_unit_dropins_and_exec(tmp_path, monkeypatch):
+    fragment = tmp_path / "hermes-dashboard-mct.service"
+    dropin = tmp_path / "exact.conf"
+    fragment.write_text("[Service]\nExecStart=/fixed\n", encoding="utf-8")
+    dropin.write_text("[Service]\nEnvironment=SAFE=1\n", encoding="utf-8")
+    fragment_hash = hashlib.sha256(fragment.read_bytes()).hexdigest()
+    dropin_hash = hashlib.sha256(dropin.read_bytes()).hexdigest()
+    monkeypatch.setattr(kanban_watchers, "_DASHBOARD_FRAGMENT", fragment)
+    monkeypatch.setattr(kanban_watchers, "_DASHBOARD_FRAGMENT_SHA256", fragment_hash)
+    monkeypatch.setattr(kanban_watchers, "_DASHBOARD_DROPINS", {dropin: dropin_hash})
+    monkeypatch.setattr(kanban_watchers, "_DASHBOARD_EXEC_ARGV", "/fixed --literal")
+    monkeypatch.setattr(kanban_watchers, "_read_proc_starttime", lambda _pid: 98765)
+    stdout = "\n".join(
+        [
+            "MainPID=4242",
+            "InvocationID=dashboard-invocation-123",
+            "ControlGroup=/system.slice/hermes-dashboard-mct.service",
+            "ActiveState=active",
+            "SubState=running",
+            "NeedDaemonReload=no",
+            f"FragmentPath={fragment}",
+            f"DropInPaths={dropin}",
+            "ExecStart={ path=/fixed ; argv[]=/fixed --literal ; ignore_errors=no ; }",
+        ]
+    )
+    run_fn = lambda *args, **kwargs: subprocess.CompletedProcess(
+        args[0], 0, stdout=stdout
+    )
+
+    identity = kanban_watchers._read_dashboard_service_identity(run_fn=run_fn)
+    assert identity["loaded_hashes"] == {
+        str(fragment): fragment_hash,
+        str(dropin): dropin_hash,
+    }
+    dropin.write_text("changed", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        kanban_watchers._read_dashboard_service_identity(run_fn=run_fn)
+
+
+def test_dashboard_identity_rejects_generation_change_during_snapshot(monkeypatch):
+    monkeypatch.setattr(kanban_watchers, "_read_proc_starttime", lambda _pid: 98765)
+    before = "\n".join(
+        [
+            "MainPID=4242",
+            "InvocationID=dashboard-invocation-123",
+            "ControlGroup=/system.slice/hermes-dashboard-mct.service",
+        ]
+    )
+    after = before.replace("MainPID=4242", "MainPID=4343")
+    outputs = iter((before, after))
+
+    def run_fn(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=next(outputs))
+
+    with pytest.raises(RuntimeError, match="changed during fresh read"):
+        kanban_watchers._read_dashboard_service_identity(run_fn=run_fn)
+
+
+def test_dashboard_request_requires_fresh_claim_identity_and_rollback_readiness():
+    from hermes_cli import kanban_db as kb
+
+    now = 1000
+    request, error = kb.parse_native_lifecycle_request(
+        SimpleNamespace(
+            id="t_1234abcd",
+            body=_dashboard_request_body("t_1234abcd", expires_at=1100),
+        )
+    )
+    assert error is None and request is not None
+    task = SimpleNamespace(
+        id="t_1234abcd",
+        current_run_id=73,
+        claim_lock="claim-73",
+        claim_expires=1200,
+    )
+    decision = _evaluate_native_lifecycle_restart_request(
+        task,
+        request,
+        now=now,
+        dashboard_identity_fn=_dashboard_identity,
+        rollback_ready_fn=lambda: {
+            "rollback_ref": "refs/aion/rollback/t_2066e6dc-pr44-run3246",
+            "source_clean": True,
+        },
+    )
+
+    assert decision.accepted is True
+    assert decision.receipt["rollback_ref"].endswith("pr44-run3246")
+    assert decision.receipt["actual_pid"] == 4242
+
+
+def test_dashboard_request_rejects_stale_expiry_before_runtime_reads():
+    from hermes_cli import kanban_db as kb
+
+    request, error = kb.parse_native_lifecycle_request(
+        SimpleNamespace(
+            id="t_1234abcd",
+            body=_dashboard_request_body("t_1234abcd", expires_at=1000),
+        )
+    )
+    assert error is None and request is not None
+    calls = []
+    decision = _evaluate_native_lifecycle_restart_request(
+        SimpleNamespace(
+            id="t_1234abcd",
+            current_run_id=73,
+            claim_lock="claim-73",
+            claim_expires=1200,
+        ),
+        request,
+        now=1000,
+        dashboard_identity_fn=lambda: calls.append("identity"),
+        rollback_ready_fn=lambda: calls.append("rollback"),
+    )
+
+    assert decision.accepted is False
+    assert "expired" in decision.reason
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "identity, rollback_fn, reason",
+    [
+        (_dashboard_identity(actual_pid=4243), lambda: {"source_clean": True}, "expected_pid mismatch"),
+        (_dashboard_identity(), lambda: (_ for _ in ()).throw(RuntimeError("missing ref")), "rollback readiness"),
+    ],
+)
+def test_dashboard_request_rejects_identity_or_rollback_drift(identity, rollback_fn, reason):
+    from hermes_cli import kanban_db as kb
+
+    request, error = kb.parse_native_lifecycle_request(
+        SimpleNamespace(
+            id="t_1234abcd",
+            body=_dashboard_request_body("t_1234abcd", expires_at=1100),
+        )
+    )
+    assert error is None and request is not None
+    decision = _evaluate_native_lifecycle_restart_request(
+        SimpleNamespace(
+            id="t_1234abcd",
+            current_run_id=73,
+            claim_lock="claim-73",
+            claim_expires=1200,
+        ),
+        request,
+        now=1000,
+        dashboard_identity_fn=lambda: identity,
+        rollback_ready_fn=rollback_fn,
+    )
+
+    assert decision.accepted is False
+    assert reason in decision.reason
+
+
+def test_dashboard_action_cannot_reach_sigusr1_delivery():
+    calls = []
+    accepted = [
+        {
+            "action": "planned_dashboard_generation_transition",
+            "task_id": "t_1234abcd",
+            "nonce": "dashboard-request-0001",
+            "target_service": "hermes-dashboard-mct.service",
+        }
+    ]
+
+    assert not _dispatch_native_lifecycle_restart_signal(
+        accepted,
+        kill_fn=lambda *args: calls.append(args),
+        current_pid=4242,
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "returncode, exception, expected_status",
+    [
+        (0, None, "DELIVERED"),
+        (9, None, "REJECTED"),
+        (None, subprocess.TimeoutExpired("systemctl", 30), "AMBIGUOUS"),
+    ],
+)
+def test_dashboard_delivery_has_literal_argv_and_terminal_result_classification(
+    returncode, exception, expected_status
+):
+    dispatch = getattr(kanban_watchers, "_dispatch_native_lifecycle_action", None)
+    assert callable(dispatch), "dashboard lifecycle delivery branch is missing"
+    calls = []
+    old_identity = _dashboard_identity()
+    new_identity = _dashboard_identity(
+        actual_pid=4343,
+        actual_starttime=99876,
+        actual_invocation_id="dashboard-invocation-456",
+    )
+    identities = iter((old_identity, new_identity))
+
+    def run_fn(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if exception is not None:
+            raise exception
+        return subprocess.CompletedProcess(argv, returncode)
+
+    result = dispatch(
+        [
+            {
+                "action": "planned_dashboard_generation_transition",
+                "task_id": "t_1234abcd",
+                "nonce": "dashboard-request-0001",
+                "target_service": "hermes-dashboard-mct.service",
+                "receipt": {
+                    name: old_identity[name]
+                    for name in (
+                        "actual_pid",
+                        "actual_starttime",
+                        "actual_invocation_id",
+                        "actual_service",
+                        "actual_cgroup",
+                        "fragment_path",
+                        "dropin_paths",
+                        "loaded_hashes",
+                        "loaded_exec_argv",
+                    )
+                },
+            }
+        ],
+        run_fn=run_fn,
+        dashboard_identity_fn=lambda: next(identities),
+        rollback_ready_fn=lambda: {"rollback_ref": "fixed"},
+    )
+
+    assert result.status == expected_status
+    assert calls == [
+        (
+            ["/usr/bin/systemctl", "restart", "hermes-dashboard-mct.service"],
+            {"check": False, "timeout": 30},
+        )
+    ]
+
+
+def test_dashboard_delivery_rechecks_identity_before_literal_invocation():
+    calls = []
+    result = kanban_watchers._dispatch_native_lifecycle_action(
+        [
+            {
+                "action": "planned_dashboard_generation_transition",
+                "target_service": "hermes-dashboard-mct.service",
+                "receipt": _dashboard_identity(),
+            }
+        ],
+        run_fn=lambda *args, **kwargs: calls.append((args, kwargs)),
+        dashboard_identity_fn=lambda: _dashboard_identity(actual_pid=4243),
+        rollback_ready_fn=lambda: {"rollback_ref": "fixed"},
+    )
+
+    assert result.status == "REJECTED"
+    assert "changed before delivery" in result.reason
+    assert calls == []
+
+
+def test_dashboard_delivery_rechecks_claim_immediately_before_invocation():
+    calls = []
+    result = kanban_watchers._dispatch_native_lifecycle_action(
+        [
+            {
+                "action": "planned_dashboard_generation_transition",
+                "target_service": "hermes-dashboard-mct.service",
+                "receipt": _dashboard_identity(),
+            }
+        ],
+        run_fn=lambda *args, **kwargs: calls.append((args, kwargs)),
+        dashboard_identity_fn=_dashboard_identity,
+        rollback_ready_fn=lambda: {"rollback_ref": "fixed"},
+        pre_delivery_guard=lambda: False,
+    )
+
+    assert result.status == "REJECTED"
+    assert "claim or expiry changed" in result.reason
     assert calls == []
 
 
@@ -226,6 +636,7 @@ def test_native_lifecycle_request_temp_db_reaches_existing_sigusr1_path(
                 "expected_invocation_id": "integration-invocation-123",
                 "expected_cgroup": target_cgroup,
                 "require_board_idle": True,
+                "expires_at": int(time.time()) + 120,
             }
         }
         conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), task_id))
@@ -302,6 +713,7 @@ def test_non_closed_native_lifecycle_json_cannot_reach_callback_spawn_or_signal(
             "expected_invocation_id": "integration-invocation-123",
             "expected_cgroup": "/system.slice/hermes-gateway-gm2.service",
             "require_board_idle": True,
+            "expires_at": int(time.time()) + 120,
         }
         conn.execute(
             "UPDATE tasks SET body = ? WHERE id = ?",
