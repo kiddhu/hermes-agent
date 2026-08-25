@@ -4139,7 +4139,13 @@ def set_task_skills(
     task_id: str,
     skills: Optional[Iterable[str]],
 ) -> bool:
-    """Amend force-loaded skills on a blocked, unclaimed task."""
+    """Amend force-loaded skills on a safely parked, unclaimed task.
+
+    Besides the original blocked-task recovery path, a ``todo`` task is
+    eligible only when at least one linked parent is still nonterminal. That
+    is the exact dependency gate that prevents the dispatcher from claiming
+    the task while the amendment transaction is in flight.
+    """
     skills_list = _normalize_task_skills(skills)
     with write_txn(conn):
         row = conn.execute(
@@ -4148,15 +4154,36 @@ def set_task_skills(
         ).fetchone()
         if not row:
             return False
-        if row["status"] != "blocked":
+        dependency_gated_todo = False
+        if row["status"] == "todo":
+            dependency_gated_todo = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone() is not None
+        if row["status"] != "blocked" and not dependency_gated_todo:
             raise RuntimeError(
                 f"cannot amend skills on {row['status']} task {task_id}; "
-                "task must be blocked and unclaimed"
+                "task must be blocked or dependency-gated todo with a "
+                "nonterminal parent, and unclaimed"
             )
-        if row["claim_lock"] is not None or row["current_run_id"] is not None:
+        if (
+            row["claim_lock"] is not None
+            or row["claim_expires"] is not None
+            or row["current_run_id"] is not None
+            or row["worker_pid"] is not None
+        ):
             raise RuntimeError(
                 f"cannot amend skills on claimed task {task_id}; "
-                "task must be blocked and unclaimed"
+                "task must be safely parked and unclaimed"
+            )
+        from hermes_cli import profiles as profiles_mod
+
+        if not row["assignee"] or not profiles_mod.profile_exists(row["assignee"]):
+            raise ValueError(
+                f"cannot amend skills for unknown assignee {row['assignee']!r}"
             )
         _validate_assignee_skills(row["assignee"], skills_list)
         old_skills = Task.from_row(row).skills

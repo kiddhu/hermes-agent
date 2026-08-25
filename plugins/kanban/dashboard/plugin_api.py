@@ -835,7 +835,8 @@ class UpdateTaskBody(BaseModel):
     provider_override: Optional[str] = None
     clear_model_override: bool = False
     # Exact replacement; [] clears every force-loaded skill pin. The kernel
-    # permits this only while the task is blocked and unclaimed.
+    # permits this only while the task is blocked+unclaimed or is an unclaimed
+    # todo task held behind at least one nonterminal parent.
     skills: Optional[list[str]] = None
 
 

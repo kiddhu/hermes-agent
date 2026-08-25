@@ -1615,6 +1615,143 @@ def test_patch_blocked_task_skills_roundtrips_with_event(client, kanban_home):
     }
 
 
+def test_patch_dependency_gated_todo_skills_roundtrips_with_event(
+    client, kanban_home,
+):
+    skill_dir = (
+        kanban_home / "profiles" / "auditor" / "skills" / "test" / "audit-skill"
+    )
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: audit-skill\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+    parent = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "open parent", "assignee": "worker"},
+    ).json()["task"]
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "dependency-gated audit",
+            "body": "preserve me",
+            "assignee": "auditor",
+            "parents": [parent["id"]],
+            "skills": ["audit-skill"],
+            "model_override": "test-model",
+            "provider_override": "test-provider",
+        },
+    ).json()["task"]
+    before = client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()
+    assert before["task"]["status"] == "todo"
+    assert before["task"]["current_run_id"] is None
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"skills": []},
+    )
+
+    assert response.status_code == 200, response.text
+    after = client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()
+    assert after["task"]["skills"] == []
+    assert after["task"]["status"] == "todo"
+    assert after["links"] == before["links"]
+    assert after["runs"] == before["runs"]
+    for field in (
+        "title", "body", "assignee", "priority", "workspace_kind",
+        "workspace_path", "model_override", "provider_override",
+        "current_run_id",
+    ):
+        assert after["task"][field] == before["task"][field]
+    event = after["events"][-1]
+    assert event["kind"] == "skills_amended"
+    assert event["payload"] == {
+        "old_skills": ["audit-skill"],
+        "new_skills": [],
+    }
+
+
+def test_patch_dependency_todo_skills_rejects_mixed_fields(client):
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "open parent"},
+    ).json()["task"]
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "gated", "parents": [parent["id"]]},
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"skills": [], "priority": 99},
+    )
+
+    assert response.status_code == 400
+    assert "only field" in response.json()["detail"]
+    unchanged = client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()["task"]
+    assert unchanged["skills"] in (None, [])
+    assert unchanged["priority"] != 99
+
+
+def test_patch_dependency_todo_skills_rejects_unknown_assignee_and_skill(
+    client, kanban_home,
+):
+    skill_dir = (
+        kanban_home / "profiles" / "auditor" / "skills" / "test" / "audit-skill"
+    )
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: audit-skill\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "open parent"},
+    ).json()["task"]
+    known = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "known auditor",
+            "assignee": "auditor",
+            "parents": [parent["id"]],
+            "skills": ["audit-skill"],
+        },
+    ).json()["task"]
+    unknown = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "unknown auditor",
+            "assignee": "profile-does-not-exist",
+            "parents": [parent["id"]],
+            "skills": ["plugin:skill"],
+        },
+    ).json()["task"]
+
+    bad_skill = client.patch(
+        f"/api/plugins/kanban/tasks/{known['id']}",
+        json={"skills": ["missing-skill"]},
+    )
+    bad_assignee = client.patch(
+        f"/api/plugins/kanban/tasks/{unknown['id']}",
+        json={"skills": []},
+    )
+
+    assert bad_skill.status_code == 400
+    assert "missing-skill" in bad_skill.json()["detail"]
+    assert bad_assignee.status_code == 400
+    assert "unknown assignee" in bad_assignee.json()["detail"]
+    assert client.get(
+        f"/api/plugins/kanban/tasks/{known['id']}"
+    ).json()["task"]["skills"] == ["audit-skill"]
+    assert client.get(
+        f"/api/plugins/kanban/tasks/{unknown['id']}"
+    ).json()["task"]["skills"] == ["plugin:skill"]
+
+
 def test_patch_skills_rejects_running_task(client, kanban_home):
     task = client.post(
         "/api/plugins/kanban/tasks",

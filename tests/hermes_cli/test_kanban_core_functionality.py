@@ -3129,23 +3129,151 @@ def test_set_task_skills_amends_only_blocked_unclaimed_task(kanban_home):
         conn.close()
 
 
-@pytest.mark.parametrize("terminal_state", ["running", "archived"])
-def test_set_task_skills_rejects_running_and_archived(kanban_home, terminal_state):
+def test_set_task_skills_amends_dependency_gated_todo_unclaimed_task(kanban_home):
+    """A todo task is amendable only while a nonterminal parent gates it."""
+    _install_profile_skill(kanban_home, "auditor", "installed-skill")
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="open parent", assignee="worker")
+        tid = kb.create_task(
+            conn,
+            title="dependency-gated audit",
+            body="preserve me",
+            assignee="auditor",
+            parents=[parent],
+            skills=["installed-skill"],
+            model_override="test-model",
+            provider_override="test-provider",
+        )
+        before = kb.get_task(conn, tid)
+        before_parents = kb.parent_ids(conn, tid)
+        before_runs = kb.list_runs(conn, task_id=tid)
+
+        assert before.status == "todo"
+        assert before.current_run_id is None
+        assert before.claim_lock is None
+        assert before.worker_pid is None
+        assert kb.set_task_skills(conn, tid, []) is True
+
+        after = kb.get_task(conn, tid)
+        assert after.skills == []
+        assert after.status == "todo"
+        assert after.current_run_id is None
+        assert after.claim_lock is None
+        assert after.worker_pid is None
+        for field in (
+            "title", "body", "assignee", "priority", "workspace_kind",
+            "workspace_path", "model_override", "provider_override",
+        ):
+            assert getattr(after, field) == getattr(before, field)
+        assert kb.parent_ids(conn, tid) == before_parents
+        assert kb.list_runs(conn, task_id=tid) == before_runs
+        event = kb.list_events(conn, tid)[-1]
+        assert event.kind == "skills_amended"
+        assert event.payload == {
+            "old_skills": ["installed-skill"],
+            "new_skills": [],
+        }
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("parent_state", [None, "done", "archived"])
+def test_set_task_skills_rejects_ordinary_todo_without_open_parent(
+    kanban_home, parent_state,
+):
+    """Parentless and terminal-parent todo rows are not dependency-gated."""
+    _install_profile_skill(kanban_home, "auditor", "installed-skill")
+    conn = kb.connect()
+    try:
+        parents = []
+        if parent_state is not None:
+            parent = kb.create_task(conn, title=f"{parent_state} parent")
+            if parent_state == "done":
+                assert kb.complete_task(conn, parent)
+            else:
+                assert kb.archive_task(conn, parent)
+            parents.append(parent)
+        tid = kb.create_task(
+            conn,
+            title="ordinary todo",
+            assignee="auditor",
+            parents=parents,
+            skills=["installed-skill"],
+        )
+        assert kb.set_task_status(conn, tid, "todo")
+
+        with pytest.raises(RuntimeError, match="todo.*nonterminal parent"):
+            kb.set_task_skills(conn, tid, [])
+        assert kb.get_task(conn, tid).skills == ["installed-skill"]
+    finally:
+        conn.close()
+
+
+def test_set_task_skills_rejects_dependency_todo_with_worker_evidence(kanban_home):
+    """Any stale/live worker identity fails closed even without an open run."""
+    _install_profile_skill(kanban_home, "auditor", "installed-skill")
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="open parent")
+        tid = kb.create_task(
+            conn,
+            title="unsafe todo",
+            assignee="auditor",
+            parents=[parent],
+            skills=["installed-skill"],
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET worker_pid = 1234 WHERE id = ?", (tid,))
+
+        with pytest.raises(RuntimeError, match="claimed task"):
+            kb.set_task_skills(conn, tid, [])
+        assert kb.get_task(conn, tid).skills == ["installed-skill"]
+    finally:
+        conn.close()
+
+
+def test_set_task_skills_rejects_unknown_assignee(kanban_home):
+    """Amendment cannot make an undispatchable assignee look recovered."""
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="open parent")
+        tid = kb.create_task(
+            conn,
+            title="unknown assignee",
+            assignee="profile-does-not-exist",
+            parents=[parent],
+            skills=["plugin:skill"],
+        )
+
+        with pytest.raises(ValueError, match="unknown assignee"):
+            kb.set_task_skills(conn, tid, [])
+        assert kb.get_task(conn, tid).skills == ["plugin:skill"]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("task_state", ["ready", "running", "triage", "done", "archived"])
+def test_set_task_skills_rejects_other_lifecycle_states(kanban_home, task_state):
     _install_profile_skill(kanban_home, "auditor", "installed-skill")
     conn = kb.connect()
     try:
         tid = kb.create_task(
             conn,
-            title=f"{terminal_state} audit",
+            title=f"{task_state} audit",
             assignee="auditor",
             skills=["installed-skill"],
         )
-        if terminal_state == "running":
+        if task_state == "running":
             assert kb.claim_task(conn, tid, claimer="test") is not None
-        else:
+        elif task_state == "triage":
+            assert kb.set_task_status(conn, tid, "triage")
+        elif task_state == "done":
+            assert kb.complete_task(conn, tid)
+        elif task_state == "archived":
             assert kb.archive_task(conn, tid)
 
-        with pytest.raises(RuntimeError, match=terminal_state):
+        with pytest.raises(RuntimeError, match=task_state):
             kb.set_task_skills(conn, tid, [])
         assert kb.get_task(conn, tid).skills == ["installed-skill"]
     finally:
