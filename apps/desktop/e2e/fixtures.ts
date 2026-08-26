@@ -172,6 +172,11 @@ ${modelContextLength ? `  context_length: ${modelContextLength}\n` : ''}provider
     models:
       mock-model: {}
     context_length: 4096
+approvals:
+  # Scripted E2E tool calls are the test fixture, not untrusted user input.
+  # Let them execute instead of leaving the turn blocked on Desktop's manual
+  # approval prompt, where no test actor is available to click Run.
+  mode: off
 ${displaySection}${extraConfig ? `\n${extraConfig.trim()}\n` : ''}`
 
   fs.writeFileSync(configPath, config, 'utf8')
