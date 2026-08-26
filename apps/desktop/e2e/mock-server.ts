@@ -102,15 +102,35 @@ const INTERIM_SCRIPT: ScriptedTurn[] = [
   },
 ]
 
-/** Process-wide sequence used only to keep mock tool-call ids distinct. */
-let _toolCallSequence = 0
+/** Per-server request counter so we can walk through the script turns. */
+let _scriptIndex = 0
+
+/** Per-server counter for the sidebar-states script (independent from _scriptIndex). */
+let _sidebarScriptIndex = 0
+
+/** Per-server counter for the cross-session sidebar script. */
+let _sidebarCrossIndex = 0
+
+/** Per-server counter for the queue-stop script. */
+let _queueStopIndex = 0
+
+/** Per-server counter for the correction/session-switch script. */
+let _correctionSwitchIndex = 0
+
+/** Per-server counter for the verify-on-stop script. */
+let _verificationStopIndex = 0
 
 /** User messages received by the mock, for E2E assertions on real submits. */
 const _receivedUserTexts: string[] = []
 
-/** Reset process-wide observations and the tool-call id sequence. */
+/** Reset the script indices (called between tests via restartMockServer). */
 function resetScriptIndex(): void {
-  _toolCallSequence = 0
+  _scriptIndex = 0
+  _sidebarScriptIndex = 0
+  _sidebarCrossIndex = 0
+  _queueStopIndex = 0
+  _correctionSwitchIndex = 0
+  _verificationStopIndex = 0
   _receivedUserTexts.length = 0
 }
 
@@ -303,16 +323,6 @@ function includesBlockingClarifyTrigger(value: unknown): boolean {
  */
 export function startMockServer(options: MockServerOptions = {}): Promise<MockServer> {
   return new Promise((resolve, reject) => {
-    // Script progress belongs to this server. Playwright runs spec files in
-    // parallel, so module-level counters let one fixture consume another
-    // fixture's first tool-call turn and made both unread-dot specs observe no
-    // background process at all.
-    let scriptIndex = 0
-    let sidebarScriptIndex = 0
-    let sidebarCrossIndex = 0
-    let queueStopIndex = 0
-    let correctionSwitchIndex = 0
-    let verificationStopIndex = 0
     const receivedPrompts: string[] = []
     let resolveHeldStreamStarted: (() => void) | null = null
     let releaseHeldStream: (() => void) | null = null
@@ -421,8 +431,8 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           }
 
           if (isQueueStopTrigger) {
-            const turn = QUEUE_STOP_SCRIPT[queueStopIndex] ?? QUEUE_STOP_SCRIPT[QUEUE_STOP_SCRIPT.length - 1]
-            queueStopIndex++
+            const turn = QUEUE_STOP_SCRIPT[_queueStopIndex] ?? QUEUE_STOP_SCRIPT[QUEUE_STOP_SCRIPT.length - 1]
+            _queueStopIndex++
             if (stream) {
               streamScriptedTurn(res, model, turn)
             } else {
@@ -433,8 +443,8 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
 
           if (isVerificationStopTrigger) {
             const script = verificationStopScript(options.verificationWritePath ?? 'e2e-verification-target.py')
-            const turn = script[verificationStopIndex] ?? script[script.length - 1]
-            verificationStopIndex++
+            const turn = script[_verificationStopIndex] ?? script[script.length - 1]
+            _verificationStopIndex++
             if (stream) {
               streamScriptedTurn(res, model, turn)
             } else {
@@ -444,8 +454,8 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           }
 
           if (isCorrectionSwitchTrigger) {
-            const turn = CORRECTION_SWITCH_SCRIPT[correctionSwitchIndex] ?? CORRECTION_SWITCH_SCRIPT[CORRECTION_SWITCH_SCRIPT.length - 1]
-            correctionSwitchIndex++
+            const turn = CORRECTION_SWITCH_SCRIPT[_correctionSwitchIndex] ?? CORRECTION_SWITCH_SCRIPT[CORRECTION_SWITCH_SCRIPT.length - 1]
+            _correctionSwitchIndex++
             if (stream) {
               streamScriptedTurn(res, model, turn)
             } else {
@@ -456,8 +466,8 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
 
           if (isSidebarCrossTrigger) {
             const script = sidebarCrossScript(options.backgroundReleasePath)
-            const turn = script[sidebarCrossIndex] ?? script[script.length - 1]
-            sidebarCrossIndex++
+            const turn = script[_sidebarCrossIndex] ?? script[script.length - 1]
+            _sidebarCrossIndex++
 
             if (stream) {
               streamScriptedTurn(res, model, turn)
@@ -468,8 +478,8 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           }
 
           if (isSidebarTrigger) {
-            const turn = SIDEBAR_SCRIPT[sidebarScriptIndex] ?? SIDEBAR_SCRIPT[SIDEBAR_SCRIPT.length - 1]
-            sidebarScriptIndex++
+            const turn = SIDEBAR_SCRIPT[_sidebarScriptIndex] ?? SIDEBAR_SCRIPT[SIDEBAR_SCRIPT.length - 1]
+            _sidebarScriptIndex++
 
             if (stream) {
               streamScriptedTurn(res, model, turn)
@@ -480,8 +490,8 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           }
 
           if (isInterimTrigger) {
-            const turn = INTERIM_SCRIPT[scriptIndex] ?? INTERIM_SCRIPT[INTERIM_SCRIPT.length - 1]
-            scriptIndex++
+            const turn = INTERIM_SCRIPT[_scriptIndex] ?? INTERIM_SCRIPT[INTERIM_SCRIPT.length - 1]
+            _scriptIndex++
             if (stream) {
               streamScriptedTurn(res, model, turn)
             } else {
@@ -664,7 +674,7 @@ function streamScriptedTurn(
         sseChunk(model, {
           tool_calls: turn.toolCalls!.map((tc, idx) => ({
             index: idx,
-            id: `call_e2e_${_toolCallSequence++}_${idx}`,
+            id: `call_e2e_${_scriptIndex}_${idx}`,
             type: 'function',
             function: { name: tc.name, arguments: JSON.stringify(tc.args) },
           })),
@@ -690,7 +700,7 @@ function streamScriptedTurn(
           sseChunk(model, {
             tool_calls: turn.toolCalls!.map((tc, idx) => ({
               index: idx,
-              id: `call_e2e_${_toolCallSequence++}_${idx}`,
+              id: `call_e2e_${_scriptIndex}_${idx}`,
               type: 'function',
               function: { name: tc.name, arguments: JSON.stringify(tc.args) },
             })),
@@ -728,7 +738,7 @@ function nonStreamingScriptedTurn(
   }
   if (hasToolCalls) {
     message.tool_calls = turn.toolCalls!.map((tc, idx) => ({
-      id: `call_e2e_${_toolCallSequence++}_${idx}`,
+      id: `call_e2e_${_scriptIndex}_${idx}`,
       type: 'function',
       function: { name: tc.name, arguments: JSON.stringify(tc.args) },
     }))
@@ -748,8 +758,8 @@ function nonStreamingScriptedTurn(
 }
 
 /**
- * Reset process-wide mock observations. Each server's script progress starts
- * at turn 0 in startMockServer, independently of other concurrent fixtures.
+ * Restart the mock server's script index so each test starts from turn 0.
+ * Call this between tests that use the interim trigger.
  */
 export function restartMockServer(): void {
   resetScriptIndex()
