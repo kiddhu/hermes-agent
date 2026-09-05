@@ -1629,6 +1629,52 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # R06-A pre-spawn admission floor (bytes; 0 = disabled). Refuses to
+        # spawn a worker while aggregate host+cgroup memory headroom is below
+        # this floor, leaving the task ready for a later tick.
+        raw_admission = kanban_cfg.get("spawn_admission_min_free_bytes", 0)
+        try:
+            spawn_admission_min_free_bytes = int(raw_admission or 0)
+        except (TypeError, ValueError):
+            spawn_admission_min_free_bytes = 0
+        if spawn_admission_min_free_bytes < 0:
+            spawn_admission_min_free_bytes = 0
+        if spawn_admission_min_free_bytes:
+            logger.info(
+                "kanban dispatcher: spawn_admission_min_free_bytes=%d",
+                spawn_admission_min_free_bytes,
+            )
+
+        # R06-B/C per-worker cgroup isolation + process-level reaping. Resolve
+        # the four settings into a dict passed to dispatch_once; each limit is
+        # 0 = disabled, and isolation itself is off by default (degrading to
+        # process-group + /proc reaping which is always on).
+        def _coerce_nonneg_int(value, default=0):
+            try:
+                ival = int(value)
+            except (TypeError, ValueError):
+                return default
+            return ival if ival >= 0 else default
+
+        worker_isolation = {
+            "enabled": bool(kanban_cfg.get("worker_isolation_enabled", False)),
+            "memory_high_bytes": _coerce_nonneg_int(
+                kanban_cfg.get("worker_memory_high_bytes")
+            ),
+            "memory_max_bytes": _coerce_nonneg_int(
+                kanban_cfg.get("worker_memory_max_bytes")
+            ),
+            "pids_max": _coerce_nonneg_int(kanban_cfg.get("worker_pids_max")),
+        }
+        if worker_isolation["enabled"]:
+            logger.info(
+                "kanban dispatcher: worker_isolation_enabled memory_high=%d "
+                "memory_max=%d pids_max=%d",
+                worker_isolation["memory_high_bytes"],
+                worker_isolation["memory_max_bytes"],
+                worker_isolation["pids_max"],
+            )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1723,6 +1769,8 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     lifecycle_request_fn=_evaluate_native_lifecycle_restart_request,
+                    spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
+                    worker_isolation=worker_isolation,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

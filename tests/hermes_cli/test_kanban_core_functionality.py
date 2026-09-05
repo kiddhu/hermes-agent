@@ -1248,7 +1248,9 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
         events = kb.list_events(conn, tid)
         spawned = [e for e in events if e.kind == "spawned"]
         assert len(spawned) == 1
-        assert spawned[0].payload == {"pid": 98765}
+        # R06-C adds resource-attribution fields to the spawned payload, so
+        # assert the pid contract (not exact payload equality).
+        assert spawned[0].payload["pid"] == 98765
     finally:
         conn.close()
 

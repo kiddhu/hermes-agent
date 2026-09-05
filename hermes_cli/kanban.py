@@ -2603,10 +2603,32 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 return None
             return ival if ival >= 1 else None
 
+        def _coerce_nonneg_int(value):
+            try:
+                ival = int(value)
+            except (TypeError, ValueError):
+                return 0
+            return ival if ival >= 0 else 0
+
         max_in_progress_per_profile = _coerce_positive_int(
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        # R06-A pre-spawn admission floor (bytes; 0 = disabled).
+        spawn_admission_min_free_bytes = _coerce_nonneg_int(
+            _kanban_cfg.get("spawn_admission_min_free_bytes")
+        )
+        # R06-B/C per-worker cgroup isolation + process-level reaping.
+        worker_isolation = {
+            "enabled": bool(_kanban_cfg.get("worker_isolation_enabled", False)),
+            "memory_high_bytes": _coerce_nonneg_int(
+                _kanban_cfg.get("worker_memory_high_bytes")
+            ),
+            "memory_max_bytes": _coerce_nonneg_int(
+                _kanban_cfg.get("worker_memory_max_bytes")
+            ),
+            "pids_max": _coerce_nonneg_int(_kanban_cfg.get("worker_pids_max")),
+        }
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2618,6 +2640,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        spawn_admission_min_free_bytes = 0
+        worker_isolation = None
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2627,6 +2651,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
+            worker_isolation=worker_isolation,
         )
     if getattr(args, "json", False):
         print(json.dumps({

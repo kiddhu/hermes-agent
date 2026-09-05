@@ -3051,6 +3051,25 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # R06-A pre-spawn resource admission: refuse to spawn a new worker
+        # while aggregate host+cgroup memory headroom (MemAvailable and the
+        # gateway cgroup's memory.high - memory.current) is below this many
+        # bytes. The task stays ``ready``/unclaimed with no failure counted,
+        # so a later tick spawns it once headroom recovers. 0 (default)
+        # disables the gate. Derive from measured worker envelope + baseline,
+        # not a gateway-only guess.
+        "spawn_admission_min_free_bytes": 0,
+        # R06-B/C per-worker resource isolation + process-level reaping: when
+        # enabled, each spawned worker is moved into its own cgroup v2
+        # (hermes-kanban-<task>) so its detached descendants (background procs,
+        # LSP servers, temp subprocesses) are deterministically reaped at
+        # termination and can be memory/pids-bounded. All limits are 0 = off.
+        # Best-effort: a host without cgroup v2 (or without the privilege to
+        # create one) degrades to process-group + /proc descendant reaping.
+        "worker_isolation_enabled": False,
+        "worker_memory_high_bytes": 0,
+        "worker_memory_max_bytes": 0,
+        "worker_pids_max": 0,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

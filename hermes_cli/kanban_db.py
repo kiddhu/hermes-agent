@@ -128,6 +128,57 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# ---------------------------------------------------------------------------
+# GM directive -> Native binding prefix events (AION-GM-DIRECTIVE-NATIVE-
+# CONTINUITY-R1).  The existing native lifecycle already persists the suffix
+# ``created -> claimed -> spawned -> heartbeat -> terminal|typed_blocker``.
+# The three event kinds below make the *pre-claim* prefix durable so an
+# authoritative external GM directive is deterministically visible and bound to
+# exactly one native task before the dispatcher claims it:
+#
+#   directive_observed    -> an authenticated GM patrol read the authoritative
+#                            source (requires source_ref + immutable id +
+#                            observer profile + timestamp; prose alone cannot
+#                            emit it).
+#   directive_selected    -> the GM actually selected this directive for
+#                            execution now (awareness is NOT selection).
+#   directive_bound_native-> one directive idempotently bound to exactly one
+#                            native task; duplicate/ambiguous binding fails
+#                            closed.
+#
+# These are stored on the existing ``task_events`` surface (kind/payload); no
+# new table, queue, scheduler, or store is introduced.  Emitting these events
+# never claims or dispatches a task — the existing dispatcher remains the sole
+# executor of record.
+# ---------------------------------------------------------------------------
+DIRECTIVE_OBSERVED_KIND = "directive_observed"
+DIRECTIVE_SELECTED_KIND = "directive_selected"
+DIRECTIVE_BOUND_NATIVE_KIND = "directive_bound_native"
+DIRECTIVE_EVENT_KINDS = frozenset(
+    {
+        DIRECTIVE_OBSERVED_KIND,
+        DIRECTIVE_SELECTED_KIND,
+        DIRECTIVE_BOUND_NATIVE_KIND,
+    }
+)
+
+# Only the authenticated resident GM patrol lane may observe/select a
+# directive. Anything outside this set is not an authoritative observer and
+# cannot produce an executable binding.
+DIRECTIVE_OBSERVER_PROFILES = frozenset({"gm", "gm2"})
+
+# ``directive_selected`` disposition is a real execution selection, not
+# awareness. The only value that authorises a subsequent native binding is
+# ``EXECUTE``.
+DIRECTIVE_EXECUTE_DISPOSITION = "EXECUTE"
+
+# A directive binding may only be recorded while the carrier task is still
+# pre-claim (not yet claimed/run by the dispatcher). Once a task is ``running``,
+# ``blocked``, ``review``, ``fenced``, ``done``, or ``archived`` — or already
+# carries a ``current_run_id`` — a fresh authoritative binding would silently
+# rewrite a live (or already-executed) task's provenance, so it fails closed.
+DIRECTIVE_PRE_CLAIM_STATUSES = frozenset({"triage", "todo", "scheduled", "ready"})
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -523,6 +574,537 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
         if parsed >= 0:
             return parsed
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# R06 A — pre-spawn resource admission (aggregate host + cgroup memory
+# headroom). A worker that spawns into a memory-exhausted host/cgroup is the
+# canonical resource-pressure failure (t_e690dcc1). The admission floor below
+# lets the dispatcher refuse to spawn a new worker while aggregate headroom is
+# under the configured byte count, leaving the task ``ready`` for a later tick
+# instead of failing it. Disabled by default (0).
+# ---------------------------------------------------------------------------
+DEFAULT_SPAWN_ADMISSION_MIN_FREE_BYTES = 0
+# Sentinel returned when neither /proc nor the cgroup headroom is readable:
+# unknown headroom must never gate (fail-open, no admission refusal).
+_SPAWN_ADMISSION_UNKNOWN_HEADROOM = 1 << 62
+
+
+def _resolve_spawn_admission_min_free_bytes() -> int:
+    """Return the pre-spawn admission floor in bytes (0 = disabled)."""
+    raw = os.environ.get(
+        "HERMES_KANBAN_SPAWN_ADMISSION_MIN_FREE_BYTES", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_SPAWN_ADMISSION_MIN_FREE_BYTES
+
+
+def _read_meminfo_memavailable_bytes() -> "int | None":
+    """Best-effort read of ``/proc/meminfo`` MemAvailable (bytes); None if absent."""
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def _read_cgroup_memory_headroom_bytes() -> "int | None":
+    """Best-effort cgroup v2 headroom = max(0, memory.high - memory.current)."""
+    for base in ("/sys/fs/cgroup",):
+        try:
+            with open(os.path.join(base, "memory.high"), "r", encoding="utf-8") as fh:
+                high = fh.read().strip()
+            with open(os.path.join(base, "memory.current"), "r", encoding="utf-8") as fh:
+                current = fh.read().strip()
+        except Exception:
+            continue
+        if not high or high == "max":
+            continue
+        try:
+            return max(0, int(high) - int(current))
+        except ValueError:
+            continue
+    return None
+
+
+def _read_cgroup_attribution(pid: Optional[int] = None) -> dict:
+    """Best-effort resource attribution for a worker: cgroup path + memory.
+
+    Returns a dict with ``cgroup_path``, ``memory_current``, ``memory_high``,
+    and ``memory_max`` (each possibly ``None``). Never raises — unreadable
+    cgroup facts simply yield ``None`` fields so attribution degrades to the
+    PID/starttime identity already recorded (R06-C).
+    """
+    out: dict = {
+        "cgroup_path": None,
+        "memory_current": None,
+        "memory_high": None,
+        "memory_max": None,
+    }
+    cgroup_path = None
+    cgroup_source = f"/proc/{pid}/cgroup" if pid else "/proc/self/cgroup"
+    try:
+        with open(cgroup_source, "r", encoding="utf-8") as fh:
+            for line in fh:
+                # cgroup v2: "0::/path"; v1: "9:memory:/path"
+                parts = line.strip().split(":", 2)
+                if len(parts) == 3 and parts[2]:
+                    cgroup_path = parts[2]
+                    break
+    except Exception:
+        cgroup_path = None
+    out["cgroup_path"] = cgroup_path
+
+    # Read memory.current / memory.high / memory.max from the worker's own
+    # cgroup when resolvable, else from the root cgroup.
+    for base in ("/sys/fs/cgroup",):
+        rel = cgroup_path.lstrip("/") if cgroup_path else ""
+        root = os.path.join(base, rel) if rel else base
+        for key, filename in (
+            ("memory_current", "memory.current"),
+            ("memory_high", "memory.high"),
+            ("memory_max", "memory.max"),
+        ):
+            try:
+                with open(os.path.join(root, filename), "r", encoding="utf-8") as fh:
+                    val = fh.read().strip()
+            except Exception:
+                continue
+            if not val or val == "max":
+                continue
+            try:
+                out[key] = int(val)
+            except ValueError:
+                continue
+    return out
+
+
+def _spawn_resource_headroom_bytes(headroom_fn=None) -> int:
+    """Aggregate admission headroom = min(host MemAvailable, cgroup headroom).
+
+    ``headroom_fn`` is an injectable probe for tests; by default it reads the
+    real /proc + cgroup sources. When neither source is readable the sentinel
+    (``_SPAWN_ADMISSION_UNKNOWN_HEADROOM``) is returned so unknown headroom
+    never gates a spawn (fail-open).
+    """
+    if headroom_fn is not None:
+        return int(headroom_fn())
+    values = []
+    host = _read_meminfo_memavailable_bytes()
+    if host is not None:
+        values.append(host)
+    cgroup = _read_cgroup_memory_headroom_bytes()
+    if cgroup is not None:
+        values.append(cgroup)
+    if not values:
+        return _SPAWN_ADMISSION_UNKNOWN_HEADROOM
+    return min(values)
+
+
+def _spawn_admission_defers(headroom_bytes: int, min_free_bytes: int) -> bool:
+    """True when aggregate headroom is below the admission floor."""
+    return min_free_bytes > 0 and headroom_bytes < min_free_bytes
+
+
+# ---------------------------------------------------------------------------
+# R06 B/C — per-worker cgroup isolation (resource limits) + process-level
+# descendant reaping. The canonical defect (t_e690dcc1) is a worker whose
+# detached descendants (background procs, LSP servers, temp subprocesses)
+# survive the worker's own termination and keep holding memory/swap in the
+# gateway cgroup for hours. A per-worker cgroup v2 gives both a deterministic
+# reaping primitive (kill every PID still listed in the cgroup) AND the bounded
+# isolation the auditor requires (memory.high / memory.max / pids.max). Every
+# operation here is best-effort and fail-open: when cgroup v2 is unavailable,
+# unwritable, or unprivileged, we degrade to a process-group + /proc descendant
+# reaping so the defect is still bounded. No second control plane.
+# ---------------------------------------------------------------------------
+DEFAULT_WORKER_ISOLATION_ENABLED = False
+DEFAULT_WORKER_MEMORY_HIGH_BYTES = 0
+DEFAULT_WORKER_MEMORY_MAX_BYTES = 0
+DEFAULT_WORKER_PIDS_MAX = 0
+_CGROUP_FS_ROOT = "/sys/fs/cgroup"
+_WORKER_CGROUP_PREFIX = "hermes-kanban-"
+
+
+def _resolve_worker_isolation_settings() -> dict:
+    """Resolve per-worker cgroup isolation settings from the env bridge.
+
+    config.yaml ``kanban.worker_isolation_enabled`` and the limit keys are
+    resolved by the dispatcher caller (``hermes_cli/kanban.py`` and
+    ``gateway/kanban_watchers.py``) and passed to ``_default_spawn`` as explicit
+    keyword arguments; these env vars are the test / back-compat bridge that
+    mirrors the R06-A admission-floor pattern. Returned limits are all ``0``
+    (disabled) unless a non-negative integer is present.
+    """
+    def _env_bool(key: str, default: bool) -> bool:
+        raw = os.environ.get(key, "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+        return default
+
+    def _env_nonneg(key: str, default: int) -> int:
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw) if int(raw) >= 0 else default
+        except ValueError:
+            return default
+
+    return {
+        "enabled": _env_bool(
+            "HERMES_KANBAN_WORKER_ISOLATION", DEFAULT_WORKER_ISOLATION_ENABLED
+        ),
+        "memory_high_bytes": _env_nonneg(
+            "HERMES_KANBAN_WORKER_MEMORY_HIGH_BYTES", DEFAULT_WORKER_MEMORY_HIGH_BYTES
+        ),
+        "memory_max_bytes": _env_nonneg(
+            "HERMES_KANBAN_WORKER_MEMORY_MAX_BYTES", DEFAULT_WORKER_MEMORY_MAX_BYTES
+        ),
+        "pids_max": _env_nonneg(
+            "HERMES_KANBAN_WORKER_PIDS_MAX", DEFAULT_WORKER_PIDS_MAX
+        ),
+    }
+
+
+def _dispatcher_cgroup_path() -> Optional[str]:
+    """Return this process's cgroup v2 path (e.g. ``/system.slice/foo.service``).
+
+    Only cgroup v2's unified hierarchy (``0::/path``) is recognized. Returns
+    ``None`` on cgroup v1, an unreadable ``/proc``, or a non-cgroup host.
+    """
+    try:
+        with open("/proc/self/cgroup", "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("0::"):
+                    return line[3:] or "/"
+    except Exception:
+        return None
+    return None
+
+
+def _worker_cgroup_name(task_id: str) -> str:
+    """Stable, sanitized cgroup directory name for a task (task-scoped)."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)
+    return f"{_WORKER_CGROUP_PREFIX}{safe}"
+
+
+def _worker_cgroup_path(task_id: Optional[str]) -> Optional[str]:
+    """Absolute cgroup v2 path (relative to the fs root) for a task's worker."""
+    if not task_id:
+        return None
+    parent = _dispatcher_cgroup_path()
+    if parent is None:
+        return None
+    return f"{parent.rstrip('/')}/{_worker_cgroup_name(task_id)}"
+
+
+def _cgroup_fs_path(cgroup_path: str) -> str:
+    """Map a cgroup v2 path to its filesystem directory under ``/sys/fs/cgroup``."""
+    return os.path.join(_CGROUP_FS_ROOT, cgroup_path.lstrip("/"))
+
+
+def _cgroup_exists(cgroup_path: str) -> bool:
+    return os.path.isdir(_cgroup_fs_path(cgroup_path))
+
+
+def _ensure_subtree_controllers(parent_path: str) -> bool:
+    """Enable ``memory`` + ``pids`` in *parent_path*'s ``cgroup.subtree_control``.
+
+    A child cgroup only exposes ``memory.high`` / ``pids.max`` when its parent
+    has the corresponding controller enabled in ``subtree_control``. This is a
+    best-effort write: if the controllers aren't available at this level, or the
+    file is unwritable, it returns without raising (the child cgroup is still
+    created for reaping; only the limits are skipped). Returns True when no
+    further action is needed or the enable succeeded; False on a hard failure
+    (which the caller treats as "limits unavailable", never fatal).
+    """
+    root = _cgroup_fs_path(parent_path)
+    controllers_file = os.path.join(root, "cgroup.controllers")
+    subtree_file = os.path.join(root, "cgroup.subtree_control")
+    try:
+        with open(controllers_file, "r", encoding="utf-8") as fh:
+            available = set(fh.read().split())
+    except Exception:
+        return False
+    wanted = {"memory", "pids"}
+    if not wanted.issubset(available):
+        # Controllers not delegated to this level → cannot enable them here.
+        return False
+    try:
+        with open(subtree_file, "r", encoding="utf-8") as fh:
+            enabled = set(fh.read().split())
+    except Exception:
+        enabled = set()
+    missing = wanted - enabled
+    if not missing:
+        return True
+    try:
+        with open(subtree_file, "w", encoding="utf-8") as fh:
+            fh.write(" ".join(f"+{c}" for c in sorted(missing)))
+        return True
+    except Exception:
+        return False
+
+
+def _create_worker_cgroup(
+    task_id: str,
+    *,
+    memory_high: int = 0,
+    memory_max: int = 0,
+    pids_max: int = 0,
+) -> Optional[str]:
+    """Best-effort create of a per-worker cgroup v2 dir with resource limits.
+
+    Returns the cgroup path on success, or ``None`` on any failure (the caller
+    degrades to process-group + /proc reaping). When a stale cgroup from a prior
+    run already exists, its contents are reaped and it is reused. Limits are
+    only written when greater than zero (0 = leave the controller unbounded).
+    Never raises.
+    """
+    cgroup_path = _worker_cgroup_path(task_id)
+    if cgroup_path is None:
+        return None
+    parent = _dispatcher_cgroup_path()
+    if parent is None:
+        return None
+    fs_dir = _cgroup_fs_path(cgroup_path)
+    try:
+        # Enable the controllers we intend to apply. Failure is non-fatal: the
+        # cgroup is still created for reaping even when limits can't apply.
+        _ensure_subtree_controllers(parent)
+        os.makedirs(fs_dir, exist_ok=True)
+        for value, filename in (
+            (memory_high, "memory.high"),
+            (memory_max, "memory.max"),
+            (pids_max, "pids.max"),
+        ):
+            if value > 0:
+                try:
+                    with open(os.path.join(fs_dir, filename), "w", encoding="utf-8") as fh:
+                        fh.write(str(int(value)))
+                except Exception:
+                    continue
+        return cgroup_path
+    except Exception:
+        return None
+
+
+def _assign_pid_to_cgroup(pid: int, cgroup_path: str) -> bool:
+    """Move *pid* into *cgroup_path* via ``cgroup.procs``. Returns success."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        with open(
+            os.path.join(_cgroup_fs_path(cgroup_path), "cgroup.procs"),
+            "w", encoding="utf-8",
+        ) as fh:
+            fh.write(str(int(pid)))
+        return True
+    except Exception:
+        return False
+
+
+def _read_cgroup_pids(cgroup_path: str) -> list[int]:
+    """Read ``cgroup.procs`` for *cgroup_path* (empty on any failure)."""
+    try:
+        with open(
+            os.path.join(_cgroup_fs_path(cgroup_path), "cgroup.procs"),
+            "r", encoding="utf-8",
+        ) as fh:
+            pids: list[int] = []
+            for line in fh.read().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pids.append(int(line))
+                except ValueError:
+                    continue
+            return pids
+    except Exception:
+        return []
+
+
+def _signal_pid_ladder(pid: int, kill, *, signal, time) -> str:
+    """TERM → bounded wait → KILL for a single PID; returns an outcome token."""
+    if pid <= 0:
+        return "gone"
+    try:
+        kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return "gone"
+    for _ in range(10):
+        if not _pid_alive(pid):
+            return "terminated"
+        time.sleep(0.2)
+    try:
+        _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        kill(pid, _sigkill)
+    except (ProcessLookupError, OSError):
+        return "gone"
+    time.sleep(0.5)
+    if not _pid_alive(pid):
+        return "killed"
+    return "survivor"
+
+
+def _reap_worker_cgroup(cgroup_path: str, *, kill, signal, time) -> int:
+    """TERM→KILL every PID still in *cgroup_path* other than self.
+
+    Cgroup membership is inherited by every descendant — including ones that
+    detached into their own session — so this deterministically reaps the whole
+    worker tree even after the worker root has already exited. Returns the
+    number of PIDs signalled.
+    """
+    own = os.getpid()
+    signalled = 0
+    for pid in _read_cgroup_pids(cgroup_path):
+        if pid == own:
+            continue
+        _signal_pid_ladder(pid, kill, signal=signal, time=time)
+        signalled += 1
+    return signalled
+
+
+def _remove_worker_cgroup(cgroup_path: str) -> bool:
+    """Remove an emptied worker cgroup (best-effort; non-empty stays for retry)."""
+    try:
+        os.rmdir(_cgroup_fs_path(cgroup_path))
+        return True
+    except OSError:
+        return False
+
+
+def _reap_worker_descendants(
+    pid: Optional[int],
+    *,
+    task_id: Optional[str] = None,
+    signal_fn=None,
+) -> dict:
+    """Reap a terminated/crashed worker's descendant processes (R06-C).
+
+    The canonical defect (t_e690dcc1) is a worker whose detached descendants
+    (background procs, LSP servers, temp subprocesses) survive the worker's own
+    termination and keep holding memory/swap in the gateway cgroup for hours.
+    This is the process-level counterpart to ``reconcile_terminal_runs`` (which
+    only closes DB rows): it actually kills the descendants.
+
+    Primitive order:
+
+      1. Per-worker cgroup — when a cgroup exists (created at spawn), kill every
+         PID still listed in ``cgroup.procs``. Cgroup membership is inherited by
+         every descendant, including ones that detached into their own session,
+         so this is deterministic and race-free even after the worker root died.
+      2. Process-group + /proc descendant walk — the fallback. ``killpg(pid)``
+         catches the worker + same-group children; a transitive /proc ppid walk
+         (identity-guarded via ``_discover_descendant_pids``) catches detached
+         descendants still traceable while the worker is alive.
+
+    Never raises; any failure degrades to a no-op with evidence recorded. The
+    worker root PID is NOT signalled here: every caller already terminates the
+    root itself (``_terminate_reclaimed_worker`` / the inline TERM→KILL in
+    ``enforce_max_runtime`` / ``_fence_worker_by_identity``), or the root is
+    already dead (``detect_crashed_workers`` / ``reconcile_terminal_runs``). The
+    fallback ``killpg(pid)`` covers the root plus its same-group children; the
+    cgroup path covers the root via membership. Re-signalling the root here
+    would double-signal and break the callers' exact-signal contracts.
+    """
+    import signal as _signal
+    import time as _time
+
+    kill = signal_fn if signal_fn is not None else (
+        os.kill if hasattr(os, "kill") else None
+    )
+    info: dict = {
+        "pid": int(pid) if pid else None,
+        "task_id": task_id,
+        "cgroup_path": None,
+        "cgroup_reaped": 0,
+        "killpg_attempted": False,
+        "descendants": 0,
+        "terminated": 0,
+        "killed": 0,
+        "survivors": 0,
+    }
+    if kill is None:
+        return info
+
+    # Cgroup reaping is independent of the worker root PID: cgroup membership
+    # survives the root's exit, so a caller that only knows the task (e.g.
+    # reconcile_terminal_runs with pid=None) can still reap a leaked worker
+    # tree by cgroup alone.
+    cgroup_path = _worker_cgroup_path(task_id)
+    if cgroup_path is not None and _cgroup_exists(cgroup_path):
+        info["cgroup_path"] = cgroup_path
+        info["cgroup_reaped"] = _reap_worker_cgroup(
+            cgroup_path, kill=kill, signal=_signal, time=_time,
+        )
+        _remove_worker_cgroup(cgroup_path)
+        return info
+
+    # Fallback: snapshot descendants while the worker is (possibly) still alive,
+    # then killpg (root + same-group children), then TERM→KILL the detached
+    # descendants. The worker root itself is intentionally NOT re-signalled
+    # here — the caller already terminated it, and killpg(pid) already covers
+    # it (start_new_session makes the worker its own group leader).
+    if not pid or pid <= 0:
+        return info
+    _pid = int(pid)
+    ident = _read_process_identity(_pid)
+    descendants: set[int] = set()
+    if ident is not None:
+        descendants = _discover_descendant_pids(
+            _pid, expected_starttime=ident["starttime"],
+        )
+    # killpg(pid) only targets the worker's process group, and only when the
+    # worker is its own group leader (a worker spawned with start_new_session
+    # has pgid == pid). Guard two hazards: never signal our own process group
+    # (pid == os.getpid()), and never signal an unrelated group when pid is not
+    # a group leader (e.g. a synthetic worker pid that happens to be a live
+    # process in the caller's own group). ``os.getpgid(pid) == pid`` is the
+    # group-leader test; a dead pid raises and is skipped (nothing to reap).
+    # ``os.getpgid`` / ``os.killpg`` are POSIX-only and absent on Windows
+    # (accessing them raises AttributeError), so resolve them via getattr and
+    # skip the killpg fallback cleanly there — Windows has no POSIX process
+    # groups to signal; the /proc descendant walk below is itself POSIX-only
+    # and already degrades to an empty set on Windows.
+    _getpgid = getattr(os, "getpgid", None)
+    _killpg = getattr(os, "killpg", None)
+    if _getpgid is not None and _killpg is not None:
+        try:
+            if _pid != os.getpid() and _getpgid(_pid) == _pid:
+                _killpg(_pid, _signal.SIGTERM)
+                info["killpg_attempted"] = True
+        except (ProcessLookupError, OSError, PermissionError):
+            pass
+
+    for d in sorted(descendants):
+        if d == _pid:
+            continue
+        outcome = _signal_pid_ladder(d, kill, signal=_signal, time=_time)
+        info["descendants"] += 1
+        if outcome == "terminated" or outcome == "gone":
+            info["terminated"] += 1
+        elif outcome == "killed":
+            info["killed"] += 1
+        else:
+            info["survivors"] += 1
+    return info
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -4996,6 +5578,307 @@ def _append_event(
     )
 
 
+def _authenticated_gm_profile() -> str:
+    """Return the kernel-authenticated executing profile, fail-closed.
+
+    The observer/selector identity of a directive prefix is *not* caller
+    supplied: it is the authenticated Hermes profile under which this code is
+    running (``HERMES_PROFILE``, set by ``_apply_profile_override`` before
+    module imports). Only the resident GM patrol lanes (``gm``/``gm2``) may
+    observe/select a directive; any other authenticated profile — or no
+    authenticated profile at all — fails closed, so a non-GM caller can never
+    assert GM authority.
+    """
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if profile not in DIRECTIVE_OBSERVER_PROFILES:
+        raise PermissionError(
+            "directive_observed/directive_selected may only be emitted by the "
+            "authenticated GM patrol lane (gm|gm2); authenticated "
+            f"profile={profile!r}"
+        )
+    return profile
+
+
+def _record_directive_intake_locked(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    source_ref: str,
+    source_sha_or_immutable_id: str,
+    disposition: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    created_at: Optional[int] = None,
+) -> dict:
+    """Record the pre-claim directive prefix on ``task_id`` (existing txn).
+
+    Emits the durable ``task_events`` prefix so an authoritative external GM
+    directive is deterministically visible and idempotently bound to exactly
+    one native task before the dispatcher claims it.  Must be called from
+    within an open ``write_txn``.
+
+    Awareness and selection are distinct decisions:
+
+    * ``disposition=None`` (omitted) records only ``directive_observed`` — the
+      GM patrol read the source but has NOT selected it for execution.
+    * ``disposition="EXECUTE"`` records ``directive_observed`` ->
+      ``directive_selected`` -> ``directive_bound_native``.
+
+    Fail-closed semantics:
+
+    * ``source_ref`` and ``source_sha_or_immutable_id`` are required; prose
+      alone can never fabricate an observation.
+    * Observer/selector identity is the kernel-authenticated ``HERMES_PROFILE``
+      (must be ``gm``/``gm2``); it is never caller-asserted.
+    * ``disposition`` other than ``None``/``EXECUTE`` raises — awareness is
+      not selection, and no other value authorises binding.
+    * The carrier task must exist AND still be pre-claim (no ``current_run_id``,
+      status in ``DIRECTIVE_PRE_CLAIM_STATUSES``).
+    * One ``source_sha_or_immutable_id`` binds exactly one task.  Re-emitting
+      for the *same* task is idempotent; re-emitting for a *different* task
+      raises (ambiguous/double binding fails closed).
+    * Any malformed/empty existing ``directive_bound_native`` payload fails
+      closed (never silently skipped).
+
+    Returns a dict with ``task_id``, ``source_ref``, ``source_sha``,
+    ``selected``, ``already_bound``, and the durable ``events``.
+    """
+    if not source_ref or not str(source_ref).strip():
+        raise ValueError("directive_observed requires a non-empty source_ref")
+    if not source_sha_or_immutable_id or not str(source_sha_or_immutable_id).strip():
+        raise ValueError(
+            "directive_observed requires a non-empty source_sha_or_immutable_id"
+        )
+    if not task_id or not str(task_id).strip():
+        raise ValueError("directive binding requires a non-empty task_id")
+    if disposition not in (None, DIRECTIVE_EXECUTE_DISPOSITION):
+        raise ValueError(
+            f"directive disposition must be {DIRECTIVE_EXECUTE_DISPOSITION!r} "
+            f"(explicit execution selection) or None (awareness only), "
+            f"got {disposition!r}"
+        )
+
+    # Kernel-authenticated observer/selector identity — never caller-asserted.
+    observer_profile = _authenticated_gm_profile()
+    selector_profile = observer_profile
+
+    source_ref = str(source_ref).strip()
+    source_sha = str(source_sha_or_immutable_id).strip()
+    selected = disposition == DIRECTIVE_EXECUTE_DISPOSITION
+
+    # Verify the target task exists AND is still pre-claim so we never write
+    # dangling events nor silently rewrite a live/already-executed task's
+    # provenance. The assignee is read from the task row (source of truth),
+    # never from a caller-supplied value.
+    task_row = conn.execute(
+        "SELECT assignee, status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task_row is None:
+        raise ValueError(f"cannot bind directive to unknown task {task_id!r}")
+    task_status = task_row["status"]
+    if (
+        task_row["current_run_id"] is not None
+        or task_status not in DIRECTIVE_PRE_CLAIM_STATUSES
+    ):
+        raise ValueError(
+            f"directive binding requires a pre-claim task; task {task_id!r} has "
+            f"status={task_status!r} current_run_id={task_row['current_run_id']!r}"
+        )
+    assignee = (task_row["assignee"] or "").strip()
+    if not assignee:
+        raise ValueError(
+            f"directive binding requires the carrier task {task_id!r} to have "
+            "a non-empty assignee"
+        )
+
+    # Idempotency + fail-closed single-binding (only when selecting/binding):
+    # one immutable directive id maps to exactly one task.  Scan existing
+    # directive_bound_native events (low volume) and refuse a second task for
+    # the same id.  Malformed/empty payloads fail closed rather than being
+    # silently skipped.
+    if selected:
+        bound_rows = conn.execute(
+            "SELECT task_id, payload FROM task_events WHERE kind = ?",
+            (DIRECTIVE_BOUND_NATIVE_KIND,),
+        ).fetchall()
+        for brow in bound_rows:
+            if not brow["payload"]:
+                raise RuntimeError(
+                    "malformed directive_bound_native event (empty payload); "
+                    "failing closed"
+                )
+            try:
+                pl = json.loads(brow["payload"])
+            except Exception as exc:  # noqa: BLE001 — fail closed on corrupt row
+                raise RuntimeError(
+                    "malformed directive_bound_native event (unparseable "
+                    "payload); failing closed"
+                ) from exc
+            if not isinstance(pl, dict) or not pl.get("source_sha_or_immutable_id"):
+                raise RuntimeError(
+                    "malformed directive_bound_native event (missing "
+                    "source_sha_or_immutable_id); failing closed"
+                )
+            if pl["source_sha_or_immutable_id"] != source_sha:
+                continue
+            if brow["task_id"] == task_id:
+                # Same directive already bound to this exact task: idempotent.
+                return {
+                    "task_id": task_id,
+                    "source_ref": source_ref,
+                    "source_sha": source_sha,
+                    "selected": True,
+                    "already_bound": True,
+                    "events": [],
+                }
+            raise RuntimeError(
+                f"directive {source_sha!r} is already bound to a different "
+                f"native task {brow['task_id']!r}; ambiguous/double binding "
+                "fails closed"
+            )
+
+    now = int(time.time()) if created_at is None else created_at
+
+    observed_payload = {
+        "source_ref": source_ref,
+        "source_sha_or_immutable_id": source_sha,
+        "observer_profile": observer_profile,
+        "observed_at": now,
+    }
+    events: list[dict] = []
+
+    # directive_observed is idempotent per (task, source id): re-reading the
+    # same authoritative source must not mint a duplicate observed row (one
+    # logical lineage per task). Malformed observed payloads fail closed
+    # rather than being silently skipped.
+    observed_rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+        (task_id, DIRECTIVE_OBSERVED_KIND),
+    ).fetchall()
+    observed_exists = False
+    for orow in observed_rows:
+        if not orow["payload"]:
+            raise RuntimeError(
+                "malformed directive_observed event (empty payload); failing closed"
+            )
+        try:
+            opl = json.loads(orow["payload"])
+        except Exception as exc:  # noqa: BLE001 — fail closed on corrupt row
+            raise RuntimeError(
+                "malformed directive_observed event (unparseable payload); "
+                "failing closed"
+            ) from exc
+        if not isinstance(opl, dict) or not opl.get("source_sha_or_immutable_id"):
+            raise RuntimeError(
+                "malformed directive_observed event (missing "
+                "source_sha_or_immutable_id); failing closed"
+            )
+        if opl["source_sha_or_immutable_id"] == source_sha:
+            observed_exists = True
+    if not observed_exists:
+        _append_event(
+            conn, task_id, DIRECTIVE_OBSERVED_KIND, observed_payload, created_at=now
+        )
+        events.append({"kind": DIRECTIVE_OBSERVED_KIND, "payload": observed_payload})
+
+    if selected:
+        selected_payload = {
+            "source_ref": source_ref,
+            "selector_profile": selector_profile,
+            "disposition": disposition,
+            "selected_at": now,
+        }
+        bound_payload = {
+            "source_ref": source_ref,
+            "source_sha_or_immutable_id": source_sha,
+            "task_id": task_id,
+            "assignee": assignee,
+            "idempotency_key_or_existing_task_binding": idempotency_key,
+            "bound_at": now,
+        }
+        events.append({"kind": DIRECTIVE_SELECTED_KIND, "payload": selected_payload})
+        events.append({"kind": DIRECTIVE_BOUND_NATIVE_KIND, "payload": bound_payload})
+        _append_event(
+            conn, task_id, DIRECTIVE_SELECTED_KIND, selected_payload, created_at=now
+        )
+        _append_event(
+            conn, task_id, DIRECTIVE_BOUND_NATIVE_KIND, bound_payload, created_at=now
+        )
+
+    return {
+        "task_id": task_id,
+        "source_ref": source_ref,
+        "source_sha": source_sha,
+        "selected": selected,
+        "already_bound": False,
+        "events": events,
+    }
+
+
+def record_directive_intake(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    source_ref: str,
+    source_sha_or_immutable_id: str,
+    disposition: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    created_at: Optional[int] = None,
+) -> dict:
+    """Public entry point: open a write txn and record the directive prefix.
+
+    ``disposition`` is an explicit execution-selection decision, never a
+    default: ``None`` (omitted) records only ``directive_observed``
+    (awareness); ``"EXECUTE"`` records the full observed -> selected ->
+    bound_native lineage.
+    """
+    with write_txn(conn):
+        return _record_directive_intake_locked(
+            conn,
+            task_id=task_id,
+            source_ref=source_ref,
+            source_sha_or_immutable_id=source_sha_or_immutable_id,
+            disposition=disposition,
+            idempotency_key=idempotency_key,
+            created_at=created_at,
+        )
+
+
+def directive_binding_lineage(
+    conn: sqlite3.Connection, task_id: str
+) -> list[Event]:
+    """Return the directive prefix events for ``task_id``, oldest first.
+
+    Validates the persisted lineage is a well-formed prefix of the canonical
+    ``observed -> selected -> bound_native`` order — no duplicates, no gaps, no
+    out-of-order events.  A malformed lineage raises instead of being silently
+    projected as if authoritative.  A task with only ``observed`` (awareness,
+    no selection) returns a single-element lineage.
+    """
+    canonical = (
+        DIRECTIVE_OBSERVED_KIND,
+        DIRECTIVE_SELECTED_KIND,
+        DIRECTIVE_BOUND_NATIVE_KIND,
+    )
+    events = [
+        ev
+        for ev in list_events(conn, task_id)
+        if ev.kind in DIRECTIVE_EVENT_KINDS
+    ]
+    if len(events) > len(canonical):
+        raise ValueError(
+            f"malformed directive lineage for {task_id!r}: {len(events)} "
+            f"directive events exceed the canonical {len(canonical)}-event prefix"
+        )
+    for idx, ev in enumerate(events):
+        if ev.kind != canonical[idx]:
+            raise ValueError(
+                f"malformed directive lineage for {task_id!r}: expected "
+                f"{canonical[idx]!r} at position {idx}, got {ev.kind!r}"
+            )
+    return events
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9089,6 +9972,11 @@ def release_stale_claims(
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
         )
+        # R06-C — reap the worker's detached descendants alongside the root so
+        # a TTL reclaim cannot leak background procs / LSP servers (t_e690dcc1).
+        termination["descendants"] = _reap_worker_descendants(
+            row["worker_pid"], task_id=row["id"], signal_fn=signal_fn,
+        )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
@@ -9168,6 +10056,11 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+    )
+    # R06-C — reap the worker's detached descendants alongside the root so an
+    # operator reclaim cannot leak background procs / LSP servers (t_e690dcc1).
+    termination["descendants"] = _reap_worker_descendants(
+        row["worker_pid"], task_id=task_id, signal_fn=signal_fn,
     )
     with write_txn(conn):
         cur = conn.execute(
@@ -15726,6 +16619,15 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    resource_deferred: list[tuple[str, int, int]] = field(default_factory=list)
+    """Tasks deferred this tick by R06 A pre-spawn resource admission, as
+    ``(task_id, min_free_bytes, headroom_bytes)`` triples. The task is left
+    ``ready``/unclaimed with no failure counted — the next dispatcher tick
+    re-reads headroom and admits it once the floor is met."""
+    terminal_runs_reconciled: int = 0
+    """Count of orphaned open ``task_runs`` rows closed this tick because their
+    source task is terminal (``done``/``archived``) with ``current_run_id``
+    NULL (R06-C terminal cleanup / reaping). Idempotent and bounded."""
     session_capped: list[str] = field(default_factory=list)
     """Task ids whose workers were refused active-session admission (the
     assignee profile's canonical registry was saturated by a concurrent live
@@ -16314,6 +17216,12 @@ def enforce_max_runtime(
                 except (ProcessLookupError, OSError):
                     pass
 
+        # R06-C — process-level descendant reaping: the worker PID above may
+        # exit while its detached descendants (background procs, LSP servers,
+        # temp subprocesses) survive in the gateway cgroup. Reap them so a
+        # max-runtime timeout cannot leak processes (canonical t_e690dcc1).
+        descendants = _reap_worker_descendants(pid, task_id=tid, signal_fn=kill)
+
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -16330,6 +17238,7 @@ def enforce_max_runtime(
                     "limit_seconds": int(row["max_runtime_seconds"]),
                     "sigkill": killed,
                 }
+                payload["descendants"] = descendants
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -16430,6 +17339,11 @@ def detect_stale_running(
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
         )
+        # R06-C — reap the worker's detached descendants alongside the root so
+        # a no-heartbeat reclaim cannot leak background procs (t_e690dcc1).
+        termination["descendants"] = _reap_worker_descendants(
+            pid, task_id=tid, signal_fn=signal_fn,
+        )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -16491,6 +17405,51 @@ def detect_stale_running(
         # spawn_failed / timed_out / crashed counters.
 
     return reclaimed
+
+
+def reconcile_terminal_runs(conn: sqlite3.Connection) -> int:
+    """Close orphaned open task_runs for terminal tasks (R06-C terminal cleanup).
+
+    A task that reached ``done``/``archived`` must not still carry an open
+    ``task_runs`` row (``status='running'``, ``ended_at IS NULL``). Such rows
+    are historical artifacts from pre-``_end_run`` code paths, or a crash that
+    terminalized the task without closing its active run (canonical incident
+    t_e690dcc1 — the run664/2056/2061 projection fixture). This bounded,
+    idempotent pass closes them as ``reclaimed`` so the terminal task<->run
+    projection is consistent and downstream run-history readers never see
+    phantom live work.
+
+    Only touches rows whose source task has ``current_run_id IS NULL`` — an
+    open run still pointed to by the task is closed by ``_end_run``, not here.
+
+    Returns the number of runs closed.
+    """
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT r.id, r.task_id FROM task_runs r "
+        "JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.ended_at IS NULL AND r.status = 'running' "
+        "  AND t.status IN ('done', 'archived') "
+        "  AND t.current_run_id IS NULL"
+    ).fetchall()
+    closed = 0
+    for row in rows:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
+                "summary = COALESCE(summary, 'terminal task with orphaned open run'), "
+                "ended_at = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND ended_at IS NULL",
+                (now, row["id"]),
+            )
+            closed += cur.rowcount
+        # R06-C — a terminal task's per-worker cgroup may still hold detached
+        # descendants (background procs / LSP servers) whose worker root already
+        # exited. Cgroup membership survives the root's exit, so reap it here —
+        # this closes the "worker completed cleanly but left children" survivor
+        # case that a /proc ppid walk cannot see after reparenting (t_e690dcc1).
+        _reap_worker_descendants(None, task_id=row["task_id"])
+    return closed
 
 
 def _error_fingerprint(error_text: str) -> str:
@@ -16638,6 +17597,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
 
             pid = int(row["worker_pid"])
+            # R06-C — the worker root is gone, but its detached descendants
+            # (background procs, LSP servers, temp subprocesses) may still be
+            # alive in the cgroup, holding memory/swap (canonical t_e690dcc1).
+            # Reap them by cgroup membership (which survives the root's exit)
+            # or, failing that, by process-group + /proc walk.
+            _reap_worker_descendants(pid, task_id=row["id"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
             session_capped_exit = False
@@ -17332,6 +18297,12 @@ def release_fenced_workers(
             _fence_worker_by_identity(pid, starttime, signal_fn=signal_fn)
             _persist_fence_lineage(conn, tid, [])
 
+        # R06-C — a per-worker cgroup (created at spawn) catches detached
+        # descendants whose cwd is outside the workspace, which the
+        # cwd-containment fence above cannot see. Best-effort; no-op without a
+        # cgroup.
+        _reap_worker_descendants(pid, task_id=tid, signal_fn=signal_fn)
+
         if _read_process_identity(pid) is None and survivors == 0:
             _release_fenced(conn, tid, reason="predecessor_fenced", target=target)
             if target == "ready":
@@ -17670,7 +18641,14 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    resource_admission_verdict: str = "disabled",
+    worker_isolation: Optional[dict] = None,
+) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
@@ -17680,7 +18658,9 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     Also captures the process's starttime from ``/proc/<pid>/stat`` so
     downstream ownership checks can distinguish a recycled PID from the
     original spawned process (#AION-RL2-CORE-04, bafuxunan audit
-    t_86c15b21).
+    t_86c15b21), plus R06-C resource attribution (cgroup path + memory
+    envelope + dispatcher/assignee profile + admission verdict) so this
+    class of defect is machine-visible without host archaeology.
     """
     # Capture process identity for PID reuse detection.
     identity = _read_process_identity(int(pid))
@@ -17688,7 +18668,56 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     if identity is not None:
         spawn_payload["starttime"] = identity["starttime"]
 
+    # R06-C resource attribution: cgroup path + memory envelope at spawn.
+    attribution = _read_cgroup_attribution(int(pid))
+    if attribution.get("cgroup_path") is not None:
+        spawn_payload["cgroup_path"] = attribution["cgroup_path"]
+    if attribution.get("memory_current") is not None:
+        spawn_payload["memory_current_at_spawn"] = attribution["memory_current"]
+    memory_high_or_max = attribution.get("memory_high") or attribution.get("memory_max")
+    if memory_high_or_max is not None:
+        spawn_payload["memory_high_or_max"] = memory_high_or_max
+    _dispatcher_profile = os.environ.get("HERMES_PROFILE")
+    if _dispatcher_profile:
+        spawn_payload["dispatcher_profile"] = _dispatcher_profile
+    # Admission verdict is passed by the dispatcher (admitted when the
+    # pre-spawn gate ran and passed, disabled when no gate was configured).
+    spawn_payload["resource_admission_verdict"] = resource_admission_verdict
+    # R06 B/C — record the worker isolation verdict + configured limits so a
+    # reader of `hermes kanban tail` can see whether the worker was placed in
+    # a bounded cgroup (isolated) or ran un-isolated (degraded), without host
+    # archaeology. The cgroup_path field above already reflects the worker's
+    # actual cgroup: it ends with the hermes-kanban-<task> leaf when the spawn
+    # successfully moved the worker into its per-task cgroup. Use the same
+    # isolation dict the spawn actually consumed (config.yaml-driven, passed
+    # down from ``_dispatch_once_locked``) rather than re-reading env vars, so
+    # the verdict can never disagree with what ``_default_spawn`` did.
+    _iso = worker_isolation if worker_isolation is not None else (
+        _resolve_worker_isolation_settings()
+    )
+    spawn_payload["worker_isolation_enabled"] = bool(_iso.get("enabled"))
+    spawn_payload["worker_isolation"] = (
+        "cgroup"
+        if _iso.get("enabled")
+        and spawn_payload.get("cgroup_path", "").endswith(
+            _worker_cgroup_name(task_id)
+        )
+        else "degraded"
+    )
+    for _k, _v in (
+        ("worker_memory_high_bytes", _iso.get("memory_high_bytes")),
+        ("worker_memory_max_bytes", _iso.get("memory_max_bytes")),
+        ("worker_pids_max", _iso.get("pids_max")),
+    ):
+        if _v:
+            spawn_payload[_k] = _v
+
     with write_txn(conn):
+        _assignee_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if _assignee_row is not None and _assignee_row["assignee"]:
+            spawn_payload["assignee_profile"] = _assignee_row["assignee"]
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
             (int(pid), task_id),
@@ -17700,6 +18729,19 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", spawn_payload, run_id=run_id)
+        # R06-B automatic first heartbeat evidence: record that the worker
+        # booted, distinct from the progress heartbeat that ``heartbeat_worker``
+        # writes once the worker makes actual progress. We deliberately do NOT
+        # touch ``last_heartbeat_at`` here — that field stays a pure progress
+        # signal so ``detect_stale_running`` can still distinguish "booted but
+        # no progress" (last_heartbeat_at NULL) from "progressed then stalled"
+        # (last_heartbeat_at stale). The bounded no-progress reclaim is already
+        # enforced by ``detect_stale_running``.
+        _append_event(
+            conn, task_id, "heartbeat",
+            {"automatic": True, "phase": "spawn"},
+            run_id=run_id,
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -18558,6 +19600,8 @@ def dispatch_once(
     lifecycle_request_fn: Optional[
         Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
     ] = None,
+    spawn_admission_min_free_bytes: Optional[int] = None,
+    worker_isolation: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -18593,6 +19637,8 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             lifecycle_request_fn=lifecycle_request_fn,
+            spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
+            worker_isolation=worker_isolation,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -18610,6 +19656,8 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             lifecycle_request_fn=lifecycle_request_fn,
+            spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
+            worker_isolation=worker_isolation,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -18633,6 +19681,8 @@ def _dispatch_once_locked(
     lifecycle_request_fn: Optional[
         Callable[[Task, NativeLifecycleRequest], NativeLifecycleDecision]
     ] = None,
+    spawn_admission_min_free_bytes: Optional[int] = None,
+    worker_isolation: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -18666,12 +19716,21 @@ def _dispatch_once_locked(
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
+    # R06 B/C — resolve per-worker cgroup isolation settings once per tick
+    # (explicit caller config wins; else the env bridge / defaults).
+    _iso = worker_isolation if worker_isolation is not None else (
+        _resolve_worker_isolation_settings()
+    )
+
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
+    # R06-C terminal cleanup: close orphaned open runs for terminal tasks so
+    # the terminal task<->run projection stays consistent (t_e690dcc1).
+    result.terminal_runs_reconciled = reconcile_terminal_runs(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -18969,6 +20028,32 @@ def _dispatch_once_locked(
                             },
                         )
             continue
+        # R06 A — pre-spawn resource admission: refuse to spawn a new worker
+        # while aggregate host+cgroup memory headroom is below the configured
+        # floor. The task stays ready/unclaimed with no failure counted, so a
+        # later tick can spawn once headroom recovers. The floor is resolved
+        # from the dispatcher parameter (config.yaml kanban.*) first, then the
+        # internal env-var bridge for tests/back-compat.
+        _min_free = (
+            spawn_admission_min_free_bytes
+            if spawn_admission_min_free_bytes is not None
+            else _resolve_spawn_admission_min_free_bytes()
+        )
+        _admission_verdict = "admitted" if _min_free > 0 else "disabled"
+        if _min_free > 0:
+            _headroom = _spawn_resource_headroom_bytes()
+            if _spawn_admission_defers(_headroom, _min_free):
+                result.resource_deferred.append((row["id"], _min_free, _headroom))
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "spawn_deferred_resource",
+                            {
+                                "min_free_bytes": _min_free,
+                                "headroom_bytes": _headroom,
+                            },
+                        )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -19010,14 +20095,20 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                _kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    _kwargs["board"] = board
+                if "worker_isolation" in sig.parameters:
+                    _kwargs["worker_isolation"] = _iso
+                pid = _spawn(claimed, str(workspace), **_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    resource_admission_verdict=_admission_verdict,
+                    worker_isolation=_iso,
+                )
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -19108,14 +20199,18 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                _kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    _kwargs["board"] = board
+                if "worker_isolation" in sig.parameters:
+                    _kwargs["worker_isolation"] = _iso
+                pid = _spawn(claimed, str(workspace), **_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn, claimed.id, int(pid), worker_isolation=_iso,
+                )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
@@ -19395,6 +20490,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    worker_isolation: Optional[dict] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -19598,6 +20694,32 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+
+    # R06 B/C — per-worker cgroup isolation (resource limits) + reaping
+    # primitive. Best-effort: when worker isolation is enabled, create a
+    # per-task cgroup v2, apply the configured memory/pids limits, and move
+    # the freshly-spawned worker into it so every descendant — including ones
+    # that later detach into their own session (background procs, LSP servers,
+    # temp subprocesses) — is deterministically reaped at termination via
+    # cgroup membership. Any failure degrades to the process-group + /proc
+    # descendant reaping in ``_reap_worker_descendants``. Never raises; the
+    # worker still spawns un-isolated when cgroup setup is unavailable.
+    _iso = worker_isolation if worker_isolation is not None else (
+        _resolve_worker_isolation_settings()
+    )
+    try:
+        if _iso.get("enabled"):
+            _cgroup_path = _create_worker_cgroup(
+                task.id,
+                memory_high=int(_iso.get("memory_high_bytes", 0) or 0),
+                memory_max=int(_iso.get("memory_max_bytes", 0) or 0),
+                pids_max=int(_iso.get("pids_max", 0) or 0),
+            )
+            if _cgroup_path is not None:
+                _assign_pid_to_cgroup(proc.pid, _cgroup_path)
+    except Exception:
+        # Isolation is an optimization + hardening, never a spawn blocker.
+        pass
     return proc.pid
 
 

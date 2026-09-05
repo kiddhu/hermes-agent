@@ -1329,6 +1329,20 @@ def _handle_create(args: dict, **kw) -> str:
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    directive_source_ref = args.get("directive_source_ref")
+    directive_source_sha = args.get("directive_source_sha")
+    # Observer/selector identity is kernel-authenticated (HERMES_PROFILE), never
+    # caller-asserted — a non-GM caller cannot forge gm/gm2 authority. Selection
+    # is explicit: no default is synthesised from the observation fields.
+    directive_disposition = args.get("directive_disposition")
+    if directive_source_ref and not directive_source_sha:
+        return tool_error(
+            "directive_source_sha is required when directive_source_ref is set"
+        )
+    if directive_source_sha and not directive_source_ref:
+        return tool_error(
+            "directive_source_ref is required when directive_source_sha is set"
+        )
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -1397,6 +1411,16 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            directive_binding = None
+            if directive_source_ref:
+                directive_binding = kb.record_directive_intake(
+                    conn,
+                    task_id=new_tid,
+                    source_ref=directive_source_ref,
+                    source_sha_or_immutable_id=directive_source_sha,
+                    disposition=directive_disposition,
+                    idempotency_key=idempotency_key,
+                )
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
@@ -1405,6 +1429,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                directive_binding=directive_binding,
             )
         finally:
             conn.close()
@@ -2270,6 +2295,36 @@ KANBAN_CREATE_SCHEMA = {
                     "If a non-archived task with this key already "
                     "exists, return that task's id instead of creating "
                     "a duplicate. Useful for retry-safe automation."
+                ),
+            },
+            "directive_source_ref": {
+                "type": "string",
+                "description": (
+                    "Optional authoritative external directive source "
+                    "reference (exact GitHub issue/comment URL or other "
+                    "canonical ref) to bind to this task. When set with "
+                    "directive_source_sha, records durable directive intake "
+                    "events on the task. Observer/selector identity is the "
+                    "authenticated executing profile (HERMES_PROFILE), which "
+                    "must be 'gm' or 'gm2' — it is not caller-supplied."
+                ),
+            },
+            "directive_source_sha": {
+                "type": "string",
+                "description": (
+                    "Optional immutable id/digest of the directive source "
+                    "(comment node id or content SHA). Required when "
+                    "directive_source_ref is set; one source id binds "
+                    "exactly one task (duplicate binding fails closed)."
+                ),
+            },
+            "directive_disposition": {
+                "type": "string",
+                "enum": ["EXECUTE"],
+                "description": (
+                    "Explicit execution selection. Must be 'EXECUTE' for a real "
+                    "selection — awareness is not selection, and omitting this "
+                    "field records only directive_observed (no binding)."
                 ),
             },
             "max_runtime_seconds": {
