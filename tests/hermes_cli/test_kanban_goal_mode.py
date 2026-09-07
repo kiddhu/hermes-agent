@@ -355,6 +355,142 @@ def test_loop_blocks_when_continuation_raises_provider_error(monkeypatch):
     assert "raw provider body" not in blocked[0]
 
 
+# ---------------------------------------------------------------------------
+# Content-policy subtype preservation (FD_HERMES_GOAL_CONTENT_POLICY_CLASSIFICATION)
+# ---------------------------------------------------------------------------
+
+def test_content_policy_blocked_result_exposes_failure_reason():
+    """The terminal content-policy result must carry the typed subtype.
+
+    ``_content_policy_blocked_result`` previously omitted ``failure_reason``,
+    so ``_kanban_turn_result`` defaulted the refusal to ``provider_failure``
+    and the goal loop mislabeled a deterministic safety refusal as a
+    transient provider outage.
+    """
+    from agent.conversation_loop import _content_policy_blocked_result
+
+    result = _content_policy_blocked_result(
+        [{"role": "user", "content": "x"}],
+        1,
+        final_response="refused",
+        error_detail="provider policy",
+    )
+    assert result["failed"] is True
+    assert result["failure_reason"] == "content_policy_blocked"
+
+
+def test_kanban_turn_result_preserves_content_policy_subtype():
+    """A content-policy refusal must not be laundered into provider_failure."""
+    response, failed, error_class = goals._kanban_turn_result(
+        {
+            "final_response": "refused",
+            "failed": True,
+            "failure_reason": "content_policy_blocked",
+        }
+    )
+    assert failed is True
+    assert error_class == "content_policy_blocked"
+
+
+def test_loop_content_policy_blocked_sticky_blocks_once(monkeypatch):
+    """content_policy_blocked is a deterministic refusal: sticky block, once."""
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: pytest.fail("failed turn must not be judged"),
+    )
+    sticky = []
+
+    def _transient(_reason):
+        pytest.fail("content_policy_blocked must not use transient block")
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-content-policy",
+        goal_text="ship feature",
+        run_turn=lambda _p: pytest.fail("failed turn must not continue"),
+        task_status_fn=lambda: "running",
+        block_fn=sticky.append,
+        transient_block_fn=_transient,
+        max_turns=20,
+        first_response={
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "content_policy_blocked",
+        },
+    )
+    assert res["outcome"] == "blocked_main_failure"
+    assert res["turns_used"] == 1
+    assert res["error_class"] == "content_policy_blocked"
+    assert len(sticky) == 1  # exactly once
+    reason = sticky[0]
+    # Safe guidance: narrow/rephrase context, never provider body / auth /
+    # billing / retry advice.
+    assert "rephrase" in reason.lower() or "narrow" in reason.lower()
+    assert "auth" not in reason.lower()
+    assert "billing" not in reason.lower()
+    assert "retry" not in reason.lower()
+
+
+def test_loop_provider_failure_still_uses_transient_block(monkeypatch):
+    """Control: true provider_failure keeps the transient (retryable) path."""
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: pytest.fail("failed turn must not be judged"),
+    )
+    transient = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-provider-failure",
+        goal_text="ship feature",
+        run_turn=lambda _p: pytest.fail("failed turn must not continue"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda _reason: pytest.fail("provider_failure must use transient"),
+        transient_block_fn=transient.append,
+        max_turns=20,
+        first_response={
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "provider_failure",
+        },
+    )
+    assert res["outcome"] == "blocked_main_failure"
+    assert res["error_class"] == "provider_failure"
+    assert len(transient) == 1
+
+
+def test_loop_defers_rate_limit_failure_to_non_counting_worker_exit(monkeypatch):
+    """Control: rate_limit keeps the non-counting exit contract."""
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: pytest.fail("failed turn must not be judged"),
+    )
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-rate-limit",
+        goal_text="ship feature",
+        run_turn=lambda _p: pytest.fail("failed turn must not continue"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda _reason: pytest.fail("rate_limit must not sticky-block"),
+        transient_block_fn=lambda _reason: pytest.fail(
+            "rate_limit must not transient-block"
+        ),
+        max_turns=20,
+        first_response={
+            "final_response": "",
+            "failed": True,
+            "failure_reason": "rate_limit",
+        },
+    )
+    assert res == {
+        "outcome": "deferred_main_failure",
+        "turns_used": 1,
+        "reason": "main model failure: rate_limit; check provider billing/quota, then retry",
+        "error_class": "rate_limit",
+    }
+
+
 def test_loop_distinguishes_judge_transport_failure_from_continue(monkeypatch):
     """An unavailable judge is not evidence that the task is unfinished."""
     monkeypatch.setattr(

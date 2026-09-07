@@ -742,6 +742,10 @@ def _content_policy_blocked_result(
         "completed": False,
         "failed": True,
         "error": f"content_policy_blocked: {error_detail}",
+        # Preserve the typed subtype so callers (notably the Kanban goal loop)
+        # can distinguish a deterministic safety refusal from a transient
+        # provider outage instead of defaulting it to ``provider_failure``.
+        "failure_reason": FailoverReason.content_policy_blocked.value,
     }
 
 

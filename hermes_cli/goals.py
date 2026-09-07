@@ -1665,6 +1665,13 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
 # Goal mode must stop immediately without converting them into sticky blocks.
 _KANBAN_NON_COUNTING_FAILURES = frozenset({"billing", "rate_limit"})
 
+# These failure classes are deterministic for an unchanged prompt: the model
+# provider's safety filter refused the request. Goal mode must NOT auto-retry
+# them as transient provider outages (or mislabel them as such) — a sticky
+# capability block is the honest signal, with guidance to narrow/rephrase
+# context rather than to rotate auth/billing/credentials.
+_KANBAN_STICKY_CAPABILITY_FAILURES = frozenset({"content_policy_blocked"})
+
 
 def _kanban_turn_result(value: Any) -> Tuple[str, bool, str]:
     """Preserve the structured outcome of a quiet Kanban worker turn.
@@ -1810,6 +1817,35 @@ def run_kanban_goal_loop(
                         f"main model failure: {error_class}; check provider "
                         "billing/quota, then retry"
                     ),
+                    "error_class": error_class,
+                }
+            if error_class in _KANBAN_STICKY_CAPABILITY_FAILURES:
+                # A deterministic content-policy refusal is not a transient
+                # outage: auto-retrying an unchanged prompt would re-trip the
+                # same safety filter and burn the card. Sticky-block once with
+                # safe guidance to narrow/rephrase the task context (no raw
+                # provider body, no auth/billing/credential advice).
+                block_reason = (
+                    f"Goal-mode worker was refused by the model provider's "
+                    f"content policy filter ({error_class}) at turn "
+                    f"{turns_used}/{max_turns}. The refusal is deterministic "
+                    "for the unchanged prompt, so automatic continuation "
+                    "stopped. Narrow or rephrase the task context, then "
+                    "unblock the card to run again."
+                )
+                _log(
+                    f"kanban goal loop: task {task_id} main model refused by "
+                    f"content policy ({error_class}) at turn "
+                    f"{turns_used}/{max_turns}; sticky-blocking"
+                )
+                try:
+                    block_fn(block_reason)
+                except Exception as exc:
+                    _log(f"kanban goal loop: sticky block failed ({exc})")
+                return {
+                    "outcome": "blocked_main_failure",
+                    "turns_used": turns_used,
+                    "reason": f"main model failure: {error_class}",
                     "error_class": error_class,
                 }
             block_reason = (
