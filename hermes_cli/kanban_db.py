@@ -6924,37 +6924,46 @@ def _review_handoff_event_for_child(
     task_id: str,
     review_task_id: str,
 ) -> Optional[sqlite3.Row]:
-    """Return the latest typed handoff binding ``task_id`` to this child."""
+    """Return the latest typed handoff binding ``task_id`` to this child.
+
+    Only the latest handoff may bind: a missing, hash-invalid, or malformed
+    latest handoff, or one that binds a different auditor child, fails closed.
+    No fallback to an older valid handoff is permitted — an older handoff was
+    superseded by the latest review round and must never re-grant authority.
+    """
     rows = conn.execute(
         "SELECT id, run_id, payload FROM task_events "
-        "WHERE task_id = ? AND kind = 'review_handoff' ORDER BY id DESC",
+        "WHERE task_id = ? AND kind = 'review_handoff' ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchall()
-    for row in rows:
-        receipt = _review_handoff_receipt_from_row(task_id, row)
-        if receipt is None:
-            continue
-        if receipt.review_task_id != review_task_id:
-            return None
-        provenance = conn.execute(
-            "SELECT 1 FROM tasks author "
-            "JOIN tasks child ON child.id = ? "
-            "JOIN task_links edge ON edge.parent_id = author.id "
-            " AND edge.child_id = child.id "
-            "JOIN task_runs run ON run.id = ? AND run.task_id = author.id "
-            "WHERE author.id = ? AND author.status = 'review' "
-            "AND author.current_run_id IS NULL "
-            "AND author.claim_lock IS NULL AND author.claim_expires IS NULL "
-            "AND author.worker_pid IS NULL AND author.worker_starttime IS NULL "
-            "AND author.fence_lineage IS NULL AND author.fence_disposition IS NULL "
-            "AND author.assignee IS NOT NULL AND child.assignee IS NOT NULL "
-            "AND author.assignee != child.assignee "
-            "AND run.status = 'review_required' "
-            "AND run.outcome = 'review_required' AND run.ended_at IS NOT NULL",
-            (review_task_id, receipt.expected_run_id, task_id),
-        ).fetchone()
-        return row if provenance is not None else None
-    return None
+    if not rows:
+        return None
+    row = rows[0]
+    receipt = _review_handoff_receipt_from_row(task_id, row)
+    if receipt is None:
+        return None
+    if receipt.review_task_id != review_task_id:
+        return None
+    provenance = conn.execute(
+        "SELECT 1 FROM tasks author "
+        "JOIN tasks child ON child.id = ? "
+        "JOIN task_links edge ON edge.parent_id = author.id "
+        " AND edge.child_id = child.id "
+        "JOIN task_runs run ON run.id = ? AND run.task_id = author.id "
+        "WHERE author.id = ? AND author.status = 'review' "
+        "AND author.current_run_id IS NULL "
+        "AND author.claim_lock IS NULL AND author.claim_expires IS NULL "
+        "AND author.worker_pid IS NULL AND author.worker_starttime IS NULL "
+        "AND author.fence_lineage IS NULL AND author.fence_disposition IS NULL "
+        "AND author.assignee IS NOT NULL AND child.assignee IS NOT NULL "
+        "AND author.assignee != child.assignee "
+        "AND run.status = 'review_required' "
+        "AND run.outcome = 'review_required' AND run.ended_at IS NOT NULL "
+        "AND run.id = (SELECT MAX(r2.id) FROM task_runs r2 "
+        "              WHERE r2.task_id = author.id)",
+        (review_task_id, receipt.expected_run_id, task_id),
+    ).fetchone()
+    return row if provenance is not None else None
 
 
 def _review_handoff_parent_satisfies_child(
@@ -7151,6 +7160,158 @@ def _run_is_protocol_violation(row: sqlite3.Row) -> bool:
         return bool(json.loads(raw).get("protocol_violation"))
     except (TypeError, ValueError):
         return False
+
+
+# Closed typed plain-crash recovery receipt.  A plain crash (worker died with
+# no protocol-violation marker, e.g. ``exit_kind: unknown``) is recoverable only
+# through a *separate* lane from the protocol-violation lane: the latest
+# terminal auditor run's metadata must carry a typed ``audit_outcome``
+# (``PASS``/``PASS_EXACT_HEAD``), an explicit ``prior_bound_review_run_id``
+# binding to the crashed predecessor, the exact ``head``/``tree``/``base``
+# commit identity, and a clean ``no_side_effect_receipt``.  The receipt itself
+# is that closed 5-key binding — repository/PR are bound by the signed
+# review-handoff (validated by the consumer), not by this receipt.  The
+# forgeable prose ``recovery_run_verification`` list is never read and never
+# grants authority.
+_PLAIN_CRASH_TERMINAL_KEYS = {
+    "audit_outcome", "head", "tree", "base", "prior_bound_review_run_id",
+}
+_PLAIN_CRASH_NO_SIDE_EFFECT_KEYS = {
+    "broad_signal_count", "manual_claim", "manual_dispatch", "raw_db_write",
+    "replacement_task_count", "secret_exposure",
+}
+# Closed producer-origin crash-attribution grammar: the only exit kinds the
+# reap registry stamps for a genuine (non-protocol-violation) crash.  Any
+# other value — empty/whitespace/arbitrary string, a non-string, or an
+# explicit ``protocol_violation`` marker (true OR false) — is not a
+# producer-origin plain crash and fails closed.
+_PLAIN_CRASH_EXIT_KINDS = {
+    "unknown", "nonzero_exit", "signaled", "session_limit_exit",
+}
+
+
+def _run_is_plain_crash(row: sqlite3.Row) -> bool:
+    """True when a closed run is a plain (non-protocol-violation) crash.
+
+    A plain crash is a ``crashed``/``crashed`` run whose metadata carries an
+    explicit ``exit_kind`` attribution drawn from the closed producer-origin
+    grammar (``unknown``/``nonzero_exit``/``signaled``/``session_limit_exit``)
+    and no ``protocol_violation`` marker — any present marker (true OR false)
+    is rejected, so an explicit ``protocol_violation: false`` is not a
+    plain-crash attribution.  It is the complement of
+    ``_run_is_protocol_violation`` and is recoverable only when the latest
+    terminal run's typed metadata additionally binds
+    ``prior_bound_review_run_id`` to it and carries a PASS-type
+    ``audit_outcome`` (see ``_run_is_authenticated_crashed_predecessor``).
+    """
+    if row["status"] != "crashed" or row["outcome"] != "crashed":
+        return False
+    raw = row["metadata"]
+    if not raw:
+        return False
+    try:
+        meta = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(meta, dict) or "protocol_violation" in meta:
+        return False
+    return meta.get("exit_kind") in _PLAIN_CRASH_EXIT_KINDS
+
+
+def _run_is_authenticated_crashed_predecessor(
+    row: sqlite3.Row, terminal_binding: dict[str, Any], *, lane: str,
+) -> bool:
+    """Authenticate a crashed predecessor for exactly one lane.
+
+    ``lane="protocol"`` requires a proven protocol-violation crash
+    (``_run_is_protocol_violation``, unchanged).  ``lane="plain"`` requires a
+    plain (non-protocol-violation) crash whose terminal run's typed binding
+    explicitly names this predecessor (``prior_bound_review_run_id == id``) and
+    carries a PASS-type ``audit_outcome``.  A protocol-violation crash is never
+    authenticated through the plain-crash lane, and a plain crash is never
+    authenticated through the protocol-violation lane, so the two lanes stay
+    strictly separate.
+    """
+    if lane == "protocol":
+        return _run_is_protocol_violation(row)
+    if lane != "plain":
+        return False
+    if _run_is_protocol_violation(row) or not _run_is_plain_crash(row):
+        return False
+    if not isinstance(terminal_binding, dict):
+        return False
+    prior = terminal_binding.get("prior_bound_review_run_id")
+    if isinstance(prior, bool) or type(prior) is not int or prior <= 0:
+        return False
+    return (
+        prior == int(row["id"])
+        and terminal_binding.get("audit_outcome") in ("PASS", "PASS_EXACT_HEAD")
+    )
+
+
+def _canonical_plain_crash_pass_recovery_receipt(
+    receipt: Any,
+) -> Optional[dict[str, Any]]:
+    """Return one strictly closed plain-crash PASS recovery receipt.
+
+    The receipt is the closed 5-key terminal binding ``audit_outcome``/
+    ``head``/``tree``/``base``/``prior_bound_review_run_id``.  Repository/PR are
+    bound by the signed review-handoff (validated by the consumer), not here.
+    Any extra/missing key, non-PASS outcome, non-SHA head/tree/base, or invalid
+    prior-run id fails closed.
+    """
+    if not isinstance(receipt, dict) or set(receipt) != _PLAIN_CRASH_TERMINAL_KEYS:
+        return None
+    prior_run = receipt.get("prior_bound_review_run_id")
+    if (
+        receipt.get("audit_outcome") not in ("PASS", "PASS_EXACT_HEAD")
+        or any(
+            not isinstance(receipt.get(key), str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", receipt[key]) is None
+            for key in ("head", "tree", "base")
+        )
+        or isinstance(prior_run, bool)
+        or type(prior_run) is not int
+        or prior_run <= 0
+    ):
+        return None
+    return {key: receipt[key] for key in sorted(_PLAIN_CRASH_TERMINAL_KEYS)}
+
+
+def _closed_plain_crash_terminal_binding(
+    metadata: dict,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Extract the typed plain-crash terminal binding and a clean no-side-effect.
+
+    The binding is the closed 5-key set ``audit_outcome``/``head``/``tree``/
+    ``base``/``prior_bound_review_run_id`` present at the top level of the
+    terminal run metadata.  A nested or top-level-plus-nested ``recovery_receipt``
+    family, a missing key, or a non-clean ``no_side_effect_receipt`` fails
+    closed.  Extra prose fields (``recovery_run_verification``, ``ci``,
+    ``changed_files``, ``auditor``/``author``, ``worker_session_id``) are
+    ignored and never grant authority.
+    """
+    if not isinstance(metadata, dict):
+        return None, None
+    if "recovery_receipt" in metadata:
+        return None, None
+    if not _PLAIN_CRASH_TERMINAL_KEYS.issubset(set(metadata)):
+        return None, None
+    nse = metadata.get("no_side_effect_receipt")
+    if not isinstance(nse, dict) or set(nse) != _PLAIN_CRASH_NO_SIDE_EFFECT_KEYS:
+        return None, None
+    for key in (
+        "broad_signal_count", "manual_claim", "manual_dispatch",
+        "raw_db_write", "replacement_task_count",
+    ):
+        if type(nse.get(key)) is not int or nse[key] != 0:
+            return None, None
+    if nse.get("secret_exposure") != "none":
+        return None, None
+    return (
+        {key: metadata[key] for key in sorted(_PLAIN_CRASH_TERMINAL_KEYS)},
+        "top_level",
+    )
 
 
 def _canonical_completed_recovery_payload(row: sqlite3.Row) -> Optional[dict[str, Any]]:
@@ -9802,15 +9963,19 @@ def _authenticated_predecessor_crashed_pass_run_id(
     auditor_profile: str,
     terminal_run_id: int,
     terminal_receipt: dict[str, Any],
+    handoff_event_id: int,
+    lane: str = "protocol",
 ) -> Optional[int]:
-    """Authenticate the crashed protocol-violation PASS before a terminal PASS.
+    """Authenticate the crashed predecessor PASS before a terminal PASS.
 
     Returns the predecessor run id only when the auditor has exactly two closed
-    runs — a latest completed terminal run and a single crashed
-    protocol-violation predecessor — and the predecessor emitted exactly one
-    version-1 PASS verdict, mirrored byte-identically on author and child,
-    whose prose reason re-states the identical head/tree/base commit identity
-    of the terminal receipt.
+    runs — a latest completed terminal run and a single crashed predecessor —
+    and the predecessor emitted exactly one version-1 PASS verdict, mirrored
+    byte-identically on author and child, whose prose reason re-states the
+    identical head/tree/base commit identity of the terminal receipt.  Both the
+    author-side verdict and its auditor-side mirror must postdate the current
+    signed review-handoff (event id strictly greater than ``handoff_event_id``),
+    so a predecessor PASS minted under a superseded handoff never authenticates.
     """
     runs = conn.execute(
         "SELECT id, profile, status, outcome, metadata, ended_at FROM task_runs "
@@ -9827,14 +9992,15 @@ def _authenticated_predecessor_crashed_pass_run_id(
         or terminal["ended_at"] is None
         or predecessor["profile"] != auditor_profile
         or predecessor["ended_at"] is None
-        or not _run_is_protocol_violation(predecessor)
+        or not _run_is_authenticated_crashed_predecessor(predecessor, terminal_receipt, lane=lane)
     ):
         return None
     predecessor_run_id = int(predecessor["id"])
 
     author_verdicts = conn.execute(
         "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' ORDER BY id", (author_task_id,),
+        "AND kind = 'review_verdict' AND id > ? ORDER BY id",
+        (author_task_id, handoff_event_id),
     ).fetchall()
     matched = []
     for row in author_verdicts:
@@ -9851,8 +10017,8 @@ def _authenticated_predecessor_crashed_pass_run_id(
         return None
     child_verdicts = conn.execute(
         "SELECT run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'review_verdict' AND run_id = ? ORDER BY id",
-        (auditor_task_id, predecessor_run_id),
+        "AND kind = 'review_verdict' AND run_id = ? AND id > ? ORDER BY id",
+        (auditor_task_id, predecessor_run_id, handoff_event_id),
     ).fetchall()
     if len(child_verdicts) != 1:
         return None
@@ -9908,6 +10074,15 @@ def _recover_completed_pass_verdict(
     ).fetchone() is None:
         return False
 
+    # A current signed review-handoff must bind the author to this exact
+    # auditor child before any recovery PASS is minted; without it the recovery
+    # would grant typed PASS authority with no signed handoff, and a predecessor
+    # PASS minted under a superseded handoff would otherwise authenticate.
+    handoff = _review_handoff_event_for_child(conn, task_id, review_task_id)
+    if handoff is None:
+        return False
+    handoff_event_id = int(handoff["id"])
+
     author = conn.execute(
         "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -9959,11 +10134,35 @@ def _recover_completed_pass_verdict(
         metadata, _COMPLETED_RECOVERY_RECEIPT_KEYS,
     )
     if (
-        expected_receipt is None
-        or receipt_family != "top_level"
-        or receipt != expected_receipt
+        expected_receipt is not None
+        and receipt_family == "top_level"
+        and receipt == expected_receipt
     ):
-        return False
+        # Lane 1 (protocol-violation): closed commit-bound GitHub APPROVED
+        # completed-audit PASS receipt.  The crashed predecessor must be a
+        # proven protocol-violation crash.
+        lane = "protocol"
+        predecessor_receipt = receipt
+    else:
+        # Lane 2 (plain crash): closed typed plain-crash terminal binding plus a
+        # controller-supplied repository/PR.  The crashed predecessor must be a
+        # plain (non-protocol-violation) crash explicitly bound by the terminal
+        # run's prior_bound_review_run_id and PASS-type audit_outcome.
+        expected_receipt = _canonical_plain_crash_pass_recovery_receipt(recovery_receipt)
+        binding, binding_family = _closed_plain_crash_terminal_binding(metadata)
+        if (
+            expected_receipt is None
+            or binding_family != "top_level"
+            or binding is None
+            or any(
+                expected_receipt[key] != binding[key]
+                for key in _PLAIN_CRASH_TERMINAL_KEYS
+            )
+        ):
+            return False
+        lane = "plain"
+        receipt = binding
+        predecessor_receipt = binding
 
     predecessor_run_id = _authenticated_predecessor_crashed_pass_run_id(
         conn,
@@ -9971,7 +10170,9 @@ def _recover_completed_pass_verdict(
         auditor_task_id=review_task_id,
         auditor_profile=FACTORY_REVIEW_AUDITOR_PROFILE,
         terminal_run_id=expected_review_run_id,
-        terminal_receipt=receipt,
+        terminal_receipt=predecessor_receipt,
+        handoff_event_id=handoff_event_id,
+        lane=lane,
     )
     if predecessor_run_id is None:
         return False
