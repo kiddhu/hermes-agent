@@ -9323,6 +9323,93 @@ def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
     return {key: value[key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)}
 
 
+# Typed non-PR internal-audit evidence. The review-verdict PASS path is
+# commit-bound (repository/PR/head/tree/base + GitHub APPROVED review) for
+# code/PR audits. A host-configuration readback audit has no repository or PR,
+# so it attests the SAME role-separated lifecycle with a closed, narrowly typed
+# evidence shape instead: one closed ``audit_type`` plus a non-empty list of
+# exact artifact ``{path, sha256}`` bindings. This is the ONLY non-PR variant
+# and it is never a substitute for the commit-bound route (see
+# :func:`_record_review_verdict`, which rejects a structured PR candidate
+# handoff when selecting the non-PR route).
+_NON_PR_AUDIT_EVIDENCE_KEYS = {"audit_type", "artifacts"}
+_NON_PR_AUDIT_ARTIFACT_KEYS = {"path", "sha256"}
+_NON_PR_AUDIT_TYPE = "host_config_readback"
+
+
+def _sha256_file(path: str) -> Optional[str]:
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _non_pr_audit_artifact_root(
+    conn: sqlite3.Connection, audit_task_id: str,
+) -> Optional[str]:
+    """Resolve the audit task's workspace directory the artifacts must live in."""
+    row = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id=?", (audit_task_id,),
+    ).fetchone()
+    if (
+        not row
+        or not isinstance(row["workspace_path"], str)
+        or not row["workspace_path"].strip()
+    ):
+        return None
+    return str(Path(row["workspace_path"]).resolve())
+
+
+def _canonical_non_pr_audit_evidence(
+    value: Any, *, artifact_root: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Validate the one closed typed non-PR internal-audit attestation.
+
+    Accepts exactly ``{"audit_type": "host_config_readback", "artifacts":
+    [{"path", "sha256"}, ...]}``. ``artifact_root`` is the resolved audit-task
+    workspace directory the artifacts must live under, so the evidence is
+    causally bound to the audit task rather than an arbitrary unrelated file.
+    Every artifact must be a real, readable, regular file whose bytes hash to
+    the attested sha256. Any malformed, mixed, duplicate, out-of-root, missing,
+    unreadable, or hash-drifted shape fails closed (``None``).
+    """
+    if not isinstance(value, dict) or set(value) != _NON_PR_AUDIT_EVIDENCE_KEYS:
+        return None
+    if value["audit_type"] != _NON_PR_AUDIT_TYPE:
+        return None
+    artifacts = value["artifacts"]
+    if not isinstance(artifacts, list) or not artifacts:
+        return None
+    root: Optional[Path] = Path(artifact_root).resolve() if artifact_root else None
+    if root is None:
+        return None
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != _NON_PR_AUDIT_ARTIFACT_KEYS:
+            return None
+        path, sha = artifact["path"], artifact["sha256"]
+        if type(path) is not str or not path.strip() or not os.path.isabs(path):
+            return None
+        if type(sha) is not str or re.fullmatch(r"[0-9a-f]{64}", sha) is None:
+            return None
+        resolved = Path(path).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return None
+        resolved_key = str(resolved)
+        if resolved_key in seen:
+            return None
+        if not resolved.is_file() or _sha256_file(resolved_key) != sha:
+            return None
+        seen.add(resolved_key)
+        normalized.append({"path": resolved_key, "sha256": sha})
+    normalized.sort(key=lambda item: item["path"])
+    return {"audit_type": value["audit_type"], "artifacts": normalized}
+
+
 def _canonical_current_audit_outcome(
     conn: sqlite3.Connection, author_task_id: str,
 ) -> tuple[bool, Optional[dict[str, Any]]]:
@@ -9375,16 +9462,40 @@ def _canonical_current_audit_outcome(
         "evidence", "scope", "disposition", "continuation_ids",
     }
     continuation_ids = payload.get("continuation_ids")
+    pr_evidence = _canonical_audit_evidence(payload.get("evidence"))
+    non_pr_evidence = _canonical_non_pr_audit_evidence(
+        payload.get("evidence"),
+        artifact_root=_non_pr_audit_artifact_root(conn, row["task_id"]),
+    )
+    evidence_ok = (
+        pr_evidence == payload.get("evidence")
+        or non_pr_evidence == payload.get("evidence")
+    )
+    if pr_evidence is not None:
+        target_ok = (
+            isinstance(target, dict)
+            and target == {"version": 1, "candidate": {
+                key: payload["evidence"][key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)
+            }, "summary": target.get("summary")}
+            and type(target.get("summary")) is str and bool(target["summary"].strip())
+        )
+    else:
+        # Non-PR route: the handoff reason must be prose (not a structured
+        # candidate envelope) — that is what distinguishes a config/readback
+        # audit from a code/PR audit that must stay on the commit-bound route.
+        target_ok = (
+            not isinstance(target, dict)
+            and handoff is not None
+            and isinstance(handoff.reason, str)
+            and bool(handoff.reason.strip())
+        )
     valid = (
         set(payload) == required and payload.get("version") == 3
         and payload.get("author_task_id") == author_task_id
         and payload.get("audit_task_id") == row["task_id"] and payload.get("audit_run_id") == row["run_id"]
         and payload.get("verdict") == "PASS" and payload.get("scope") == "audit_obligation"
-        and _canonical_audit_evidence(payload.get("evidence")) == payload.get("evidence")
-        and isinstance(target, dict) and target == {"version": 1, "candidate": {
-            key: payload["evidence"][key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)
-        }, "summary": target.get("summary")}
-        and type(target["summary"]) is str and bool(target["summary"].strip())
+        and evidence_ok
+        and target_ok
         and type(payload.get("reason")) is str and bool(payload["reason"].strip())
         and type(digest) is str and hashlib.sha256(encoded).hexdigest() == digest
         and handoff is not None and handoff.review_task_id == row["task_id"]
@@ -9526,9 +9637,17 @@ def _record_review_verdict(
     if verdict == "pass" and evidence is None:
         return False
     normalized_evidence: Optional[dict[str, Any]] = None
+    is_non_pr = False
     with write_txn(conn):
         if verdict == "pass" and evidence is not None:
-            if (normalized_evidence := _canonical_audit_evidence(evidence)) is None:
+            normalized_evidence = _canonical_audit_evidence(evidence)
+            is_non_pr = normalized_evidence is None
+            if is_non_pr:
+                normalized_evidence = _canonical_non_pr_audit_evidence(
+                    evidence,
+                    artifact_root=_non_pr_audit_artifact_root(conn, review_task_id),
+                )
+            if normalized_evidence is None:
                 return False
             present, receipt = _canonical_current_audit_outcome(conn, task_id)
             if present:
@@ -9653,15 +9772,24 @@ def _record_review_verdict(
             if parent_ids(conn, review_task_id) != [task_id] or handoff is None:
                 return False
             receipt = _review_handoff_receipt_from_row(task_id, handoff)
+            if receipt is None:
+                return False
             try:
-                target = json.loads(receipt.reason) if receipt is not None else None
+                target = json.loads(receipt.reason)
             except (TypeError, ValueError):
-                return False
-            expected = {key: normalized_evidence[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
-            if not isinstance(target, dict) or target != {
-                "version": 1, "candidate": expected, "summary": target.get("summary")
-            } or type(target["summary"]) is not str or not target["summary"].strip():
-                return False
+                target = None
+            if is_non_pr:
+                # Non-PR route: reject a structured candidate handoff (a
+                # code/PR audit must stay on the commit-bound route), and
+                # require a non-empty prose handoff reason.
+                if isinstance(target, dict) or not receipt.reason.strip():
+                    return False
+            else:
+                expected = {key: normalized_evidence[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
+                if not isinstance(target, dict) or target != {
+                    "version": 1, "candidate": expected, "summary": target.get("summary")
+                } or type(target["summary"]) is not str or not target["summary"].strip():
+                    return False
             return _terminalize_review_pass(
                 conn, author_task_id=task_id, audit_task_id=review_task_id,
                 audit_run_id=expected_review_run_id, reason=reason,

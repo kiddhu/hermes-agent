@@ -2012,17 +2012,49 @@ KANBAN_REVIEW_VERDICT_SCHEMA = {
             },
             "reason": {"type": "string", "description": "Concrete verdict evidence or findings."},
             "evidence": {
-                "type": "object",
-                "description": "Commit-bound evidence required for PASS.",
-                "properties": {
-                    "repository": {"type": "string"}, "pr": {"type": "integer"},
-                    "head": {"type": "string"}, "tree": {"type": "string"},
-                    "base": {"type": "string"}, "github_review_id": {"type": "integer"},
-                    "github_review_url": {"type": "string"},
-                    "github_review_state": {"type": "string", "enum": ["APPROVED"]},
-                },
-                "required": ["repository", "pr", "head", "tree", "base", "github_review_id", "github_review_url", "github_review_state"],
-                "additionalProperties": False,
+                "description": (
+                    "Evidence required for PASS. Exactly one of two shapes: "
+                    "(a) commit-bound GitHub PR review evidence for code/PR "
+                    "audits, or (b) a typed non-PR internal-audit receipt for "
+                    "a host-configuration readback audit (no repository/PR "
+                    "exists). The two are mutually exclusive; mixing fields "
+                    "fails closed."
+                ),
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "repository": {"type": "string"}, "pr": {"type": "integer"},
+                            "head": {"type": "string"}, "tree": {"type": "string"},
+                            "base": {"type": "string"}, "github_review_id": {"type": "integer"},
+                            "github_review_url": {"type": "string"},
+                            "github_review_state": {"type": "string", "enum": ["APPROVED"]},
+                        },
+                        "required": ["repository", "pr", "head", "tree", "base", "github_review_id", "github_review_url", "github_review_state"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "audit_type": {"type": "string", "enum": ["host_config_readback"]},
+                            "artifacts": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "sha256": {"type": "string"},
+                                    },
+                                    "required": ["path", "sha256"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["audit_type", "artifacts"],
+                        "additionalProperties": False,
+                    },
+                ],
             },
             "board": _board_schema_prop(),
         },
