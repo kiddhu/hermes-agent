@@ -959,6 +959,64 @@ def _handle_review_verdict(args: dict, **kw) -> str:
         return tool_error(f"kanban_review_verdict: {e}")
 
 
+def _handle_resume_reviewed_author(args: dict, **kw) -> str:
+    """Resume a reviewed author whose direct auditor child failed closed.
+
+    GM/GM2-controller-only recovery for the SAME-author procedural-handoff
+    deadlock: the author is nonterminal in ``review``, its direct independent
+    auditor child ended blocked/triage/todo without a verdict, and only a live
+    author run can re-issue the corrected structured handoff. Returns the
+    author to ``ready`` and resets only the SAME audit child to ``todo``.
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_resume_reviewed_author")
+    if delegated_err:
+        return delegated_err
+    author_task_id = str(args.get("author_task_id") or "").strip()
+    audit_task_id = str(args.get("audit_task_id") or "").strip()
+    raw_event_id = args.get("review_handoff_event_id")
+    if not author_task_id:
+        return tool_error("author_task_id is required")
+    if not audit_task_id:
+        return tool_error("audit_task_id is required")
+    try:
+        review_handoff_event_id = int(raw_event_id)
+    except (TypeError, ValueError):
+        return tool_error("review_handoff_event_id is required and must be an integer")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            receipt = kb.resume_reviewed_author(
+                conn,
+                author_task_id=author_task_id,
+                audit_task_id=audit_task_id,
+                review_handoff_event_id=review_handoff_event_id,
+            )
+            if receipt is None:
+                return tool_error(
+                    "review author resume refused: missing/stale/forged lineage, "
+                    "active identity, existing verdict/recovery, terminal task, or "
+                    "unmet direct-child binding"
+                )
+            return _ok(
+                author_task_id=author_task_id,
+                audit_task_id=audit_task_id,
+                review_handoff_event_id=review_handoff_event_id,
+                event_id=receipt["event_id"],
+                receipt_sha256=receipt["receipt_sha256"],
+                controller_profile=receipt["controller_profile"],
+                blocker=receipt["blocker"],
+                handoff_reason_sha256=receipt["handoff_reason_sha256"],
+                author_target_status=receipt["author_target_status"],
+            )
+        finally:
+            conn.close()
+    except PermissionError as e:
+        return tool_error(f"kanban_resume_reviewed_author refused: {e}")
+    except Exception as e:
+        logger.exception("kanban_resume_reviewed_author failed")
+        return tool_error(f"kanban_resume_reviewed_author: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -2030,6 +2088,43 @@ KANBAN_REVIEW_VERDICT_SCHEMA = {
     },
 }
 
+KANBAN_RESUME_REVIEWED_AUTHOR_SCHEMA = {
+    "name": "kanban_resume_reviewed_author",
+    "description": (
+        "GM/GM2-controller recovery: resume one reviewed author whose direct "
+        "independent auditor child failed closed before a Native verdict, so "
+        "the SAME author can re-issue a corrected structured review handoff. "
+        "Returns the author to ready (or ordinary parent-gated todo when it has "
+        "unfinished parents) and resets only the SAME audit child to todo. "
+        "Idempotent on exact replay; fails closed on any stale/forged/"
+        "mismatched lineage, active identity, non-GM controller, or an "
+        "already-valid structured handoff."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "author_task_id": {
+                "type": "string",
+                "description": "The nonterminal author task currently in 'review'.",
+            },
+            "audit_task_id": {
+                "type": "string",
+                "description": (
+                    "The direct independent auditor child task (blocked/triage/todo)."
+                ),
+            },
+            "review_handoff_event_id": {
+                "type": "integer",
+                "description": (
+                    "The exact review_handoff event id of the malformed envelope to recover."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["author_task_id", "audit_task_id", "review_handoff_event_id"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2547,6 +2642,15 @@ registry.register(
     handler=_handle_review_verdict,
     check_fn=_check_kanban_mode,
     emoji="⚖",
+)
+
+registry.register(
+    name="kanban_resume_reviewed_author",
+    toolset="kanban",
+    schema=KANBAN_RESUME_REVIEWED_AUTHOR_SCHEMA,
+    handler=_handle_resume_reviewed_author,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="♻",
 )
 
 registry.register(

@@ -10276,6 +10276,398 @@ def record_review_verdict(
 
 
 # ---------------------------------------------------------------------------
+# Reviewed-author handoff recovery (GM/GM2 controller lane)
+# ---------------------------------------------------------------------------
+
+# Typed event kind minted by the reviewed-author resume operation. It is a
+# controller-scoped recovery receipt, not a review verdict: it never infers
+# PASS/REQUEST_CHANGES and never rewrites the immutable handoff/run bytes.
+REVIEW_HANDOFF_RECOVERY_EVENT_KIND = "review_handoff_recovery"
+
+
+def _review_handoff_recovery_receipt_from_row(
+    row: sqlite3.Row,
+) -> Optional[dict[str, Any]]:
+    """Parse the one strictly typed reviewed-author recovery receipt."""
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    required = {
+        "version", "author_task_id", "audit_task_id", "review_handoff_event_id",
+        "author_run_id", "audit_run_id", "controller_profile",
+        "blocker", "handoff_reason_sha256", "author_target_status",
+        "receipt_sha256",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        return None
+    strict_types = (
+        (payload["version"], int),
+        (payload["author_task_id"], str),
+        (payload["audit_task_id"], str),
+        (payload["review_handoff_event_id"], int),
+        (payload["author_run_id"], int),
+        (payload["audit_run_id"], int),
+        (payload["controller_profile"], str),
+        (payload["blocker"], str),
+        (payload["handoff_reason_sha256"], str),
+        (payload["author_target_status"], str),
+        (payload["receipt_sha256"], str),
+    )
+    if any(type(value) is not expected for value, expected in strict_types):
+        return None
+    if (
+        payload["version"] != 1
+        or not payload["author_task_id"].strip()
+        or not payload["audit_task_id"].strip()
+        or payload["author_task_id"] == payload["audit_task_id"]
+        or payload["review_handoff_event_id"] <= 0
+        or payload["author_run_id"] <= 0
+        or payload["audit_run_id"] <= 0
+        or payload["controller_profile"] not in FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+        or not payload["blocker"].strip()
+        or re.fullmatch(r"[0-9a-f]{64}", payload["handoff_reason_sha256"]) is None
+        or payload["author_target_status"] not in {"ready", "todo"}
+    ):
+        return None
+    signed = {
+        "version": payload["version"],
+        "author_task_id": payload["author_task_id"],
+        "audit_task_id": payload["audit_task_id"],
+        "review_handoff_event_id": payload["review_handoff_event_id"],
+        "author_run_id": payload["author_run_id"],
+        "audit_run_id": payload["audit_run_id"],
+        "controller_profile": payload["controller_profile"],
+        "blocker": payload["blocker"],
+        "handoff_reason_sha256": payload["handoff_reason_sha256"],
+        "author_target_status": payload["author_target_status"],
+    }
+    expected_hash = hashlib.sha256(
+        json.dumps(
+            signed, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if payload["receipt_sha256"] != expected_hash:
+        return None
+    return payload
+
+
+_REVIEW_IDENTITY_FIELDS = (
+    "current_run_id", "claim_lock", "claim_expires", "worker_pid",
+    "worker_starttime", "fence_lineage", "fence_disposition",
+)
+
+# Normalized blocker for the one exact deadlock this recovery repairs: an
+# author handed a candidate off to a direct independent auditor child whose
+# ``review_handoff`` ``reason`` is prose (not a structured candidate
+# envelope), so the current Native PASS path cannot parse it.
+REVIEW_HANDOFF_MALFORMED_ENVELOPE_BLOCKER = "malformed_review_handoff_envelope"
+
+
+def _review_handoff_reason_is_structured_candidate(reason: str) -> bool:
+    """Return ``True`` when ``reason`` is a strict structured candidate envelope.
+
+    The current Native PASS path only accepts a handoff whose ``reason`` parses
+    to the exact JSON envelope ``{"version": 1, "candidate": {repository, pr,
+    head, tree, base}, "summary": <non-empty str>}`` (see
+    :func:`_record_review_verdict`). A prose / malformed reason fails this
+    parser — and that exact failure is the SAME-author deadlock fingerprint
+    this recovery exists to repair. If the author already emitted a valid
+    structured candidate, the recovery must NOT fire: the author is stuck for
+    an unrelated reason and this is not the malformed-envelope deadlock.
+    """
+    try:
+        target = json.loads(reason)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(target, dict) or set(target) != {
+        "version", "candidate", "summary",
+    }:
+        return False
+    if target.get("version") != 1:
+        return False
+    candidate = target.get("candidate")
+    if not isinstance(candidate, dict) or set(candidate) != _CANONICAL_AUDIT_TARGET_KEYS:
+        return False
+    summary = target.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return False
+    if isinstance(candidate.get("pr"), bool) or not isinstance(
+        candidate.get("pr"), int
+    ):
+        return False
+    for key in ("repository", "head", "tree", "base"):
+        if not isinstance(candidate.get(key), str):
+            return False
+    return True
+
+
+def _authenticated_resume_controller_profile() -> str:
+    """Resolve the authenticated GM controller profile, fail-closed.
+
+    The recovery may only be issued by the resident GM patrol lane (gm|gm2).
+    A bare ``HERMES_PROFILE`` env var is mutable and can be rewritten to assert
+    GM authority (environment-based escalation), so the controller is resolved
+    from the active Hermes profile (``HERMES_HOME``) and the env marker must
+    agree with it. Delegated children are rejected at this boundary too.
+    """
+    _assert_not_delegated_child_mutation()
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        home_profile = (get_active_profile_name() or "").strip()
+    except Exception:
+        home_profile = ""
+    env_profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    gm_lanes = FACTORY_REVIEW_VERDICT_RECOVERY_CONTROLLER_PROFILES
+    if home_profile in gm_lanes:
+        if env_profile and env_profile not in gm_lanes:
+            raise PermissionError(
+                "reviewed-author resume controller identity mismatch: "
+                "HERMES_HOME resolves to GM lane "
+                f"{home_profile!r} but HERMES_PROFILE={env_profile!r}"
+            )
+        return home_profile
+    if env_profile in gm_lanes:
+        raise PermissionError(
+            "reviewed-author resume refused: HERMES_PROFILE claims GM lane "
+            f"{env_profile!r} but the active Hermes profile "
+            f"({home_profile or 'unresolved'!r}) is not a GM lane "
+            "(environment-based escalation)"
+        )
+    raise PermissionError(
+        "reviewed-author resume may only be invoked by the authenticated "
+        "GM controller lane (gm|gm2); authenticated "
+        f"profile={home_profile or env_profile!r}"
+    )
+
+
+def _resume_reviewed_author(
+    conn: sqlite3.Connection,
+    *,
+    author_task_id: str,
+    audit_task_id: str,
+    review_handoff_event_id: int,
+) -> Optional[dict[str, Any]]:
+    """Atomically resume one reviewed author whose direct audit child failed
+    closed before a Native verdict.
+
+    This is the narrow recovery for the SAME-author procedural-handoff
+    deadlock: the author is nonterminal in ``review``, its direct independent
+    auditor child ended in ``blocked``/``triage``/``todo`` without recording a
+    verdict, the handoff ``reason`` is a malformed (prose) envelope that the
+    strict candidate-envelope parser rejects, and the only way forward is for
+    the SAME author to re-run and re-issue a corrected structured handoff. It
+    returns the author to ``ready`` (or ordinary parent-gated ``todo`` when it
+    has unfinished parents) and resets only the SAME audit child to ordinary
+    parent-gated ``todo``. It records exactly one
+    typed recovery receipt and is idempotent on exact replay.
+    """
+    controller = _authenticated_resume_controller_profile()
+    try:
+        review_handoff_event_id = int(review_handoff_event_id)
+    except (TypeError, ValueError):
+        return None
+    with write_txn(conn):
+        # Idempotency / double-recovery guard on prior recovery receipts.
+        for row in conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = ? ORDER BY id",
+            (author_task_id, REVIEW_HANDOFF_RECOVERY_EVENT_KIND),
+        ).fetchall():
+            receipt = _review_handoff_recovery_receipt_from_row(row)
+            if receipt is None:
+                # A malformed/forged recovery event already exists: cannot
+                # prove idempotency, so fail closed.
+                return None
+            if (
+                receipt["author_task_id"] == author_task_id
+                and receipt["audit_task_id"] == audit_task_id
+                and receipt["review_handoff_event_id"] == review_handoff_event_id
+            ):
+                return {**receipt, "event_id": int(row["id"])}
+            # A different recovery already targeted this author: no double
+            # recovery of the same author lineage.
+            return None
+
+        author = conn.execute(
+            "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+            "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+            "FROM tasks WHERE id = ?",
+            (author_task_id,),
+        ).fetchone()
+        audit = conn.execute(
+            "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+            "worker_pid, worker_starttime, fence_lineage, fence_disposition "
+            "FROM tasks WHERE id = ?",
+            (audit_task_id,),
+        ).fetchone()
+        if author is None or audit is None:
+            return None
+        if not author["assignee"] or not audit["assignee"]:
+            return None
+        if author["assignee"] == audit["assignee"]:
+            return None
+        if (
+            author["status"] != "review"
+            or any(author[field] is not None for field in _REVIEW_IDENTITY_FIELDS)
+        ):
+            return None
+        if (
+            audit["status"] not in {"todo", "blocked", "triage"}
+            or any(audit[field] is not None for field in _REVIEW_IDENTITY_FIELDS)
+        ):
+            return None
+        if parent_ids(conn, audit_task_id) != [author_task_id]:
+            return None
+
+        handoff_row = conn.execute(
+            "SELECT id, run_id, payload FROM task_events "
+            "WHERE id = ? AND task_id = ? AND kind = 'review_handoff'",
+            (review_handoff_event_id, author_task_id),
+        ).fetchone()
+        if handoff_row is None:
+            return None
+        handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row)
+        if handoff is None or handoff.review_task_id != audit_task_id:
+            return None
+
+        # The recovery exists ONLY for the malformed-envelope deadlock: the
+        # handoff ``reason`` must FAIL the strict candidate-envelope parser
+        # (prose, not a structured {version, candidate, summary} envelope). If
+        # the author already emitted a valid structured candidate, it is stuck
+        # for an unrelated reason and this operation must fail closed.
+        if _review_handoff_reason_is_structured_candidate(handoff.reason):
+            return None
+        handoff_reason_sha256 = hashlib.sha256(
+            handoff.reason.encode("utf-8")
+        ).hexdigest()
+
+        author_run = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (handoff.expected_run_id, author_task_id),
+        ).fetchone()
+        if (
+            author_run is None
+            or author_run["status"] != "review_required"
+            or author_run["outcome"] != "review_required"
+            or author_run["ended_at"] is None
+        ):
+            return None
+        latest_author_run = conn.execute(
+            "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (author_task_id,),
+        ).fetchone()[0]
+        if latest_author_run != handoff.expected_run_id:
+            return None
+
+        audit_run = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (audit_task_id,),
+        ).fetchone()
+        if (
+            audit_run is None
+            or audit_run["ended_at"] is None
+            or audit_run["status"] != "blocked"
+            or audit_run["outcome"] != "blocked"
+        ):
+            return None
+
+        # No verdict may already have resolved this handoff.
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_verdict' "
+            "AND id > ? LIMIT 1",
+            (author_task_id, review_handoff_event_id),
+        ).fetchone() is not None:
+            return None
+
+        # The author returns to ``ready`` only when all of its parents are
+        # already satisfied; otherwise it lands in ordinary parent-gated
+        # ``todo`` and ``recompute_ready`` promotes it once the parents finish.
+        # Writing ``ready`` unconditionally would falsely advertise runnable
+        # state (the dispatcher would claim then demote it).
+        author_parents = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id WHERE l.child_id = ?",
+            (author_task_id,),
+        ).fetchall()
+        author_target_status = (
+            "ready"
+            if all(
+                _review_handoff_parent_satisfies_child(
+                    conn, parent["id"], parent["status"], author_task_id
+                )
+                for parent in author_parents
+            )
+            else "todo"
+        )
+        author_update = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, worker_starttime = NULL, "
+            "fence_lineage = NULL, fence_disposition = NULL, "
+            "block_kind = NULL, block_recurrences = 0 "
+            "WHERE id = ? AND status = 'review'",
+            (author_target_status, author_task_id),
+        )
+        if author_update.rowcount != 1:
+            raise _ReviewHandoffConflict
+        audit_update = conn.execute(
+            "UPDATE tasks SET status = 'todo', current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "worker_starttime = NULL, fence_lineage = NULL, fence_disposition = NULL, "
+            "block_kind = NULL, block_recurrences = 0 "
+            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage')",
+            (audit_task_id,),
+        )
+        if audit_update.rowcount != 1:
+            raise _ReviewHandoffConflict
+
+        core_payload = {
+            "version": 1,
+            "author_task_id": author_task_id,
+            "audit_task_id": audit_task_id,
+            "review_handoff_event_id": review_handoff_event_id,
+            "author_run_id": int(handoff.expected_run_id),
+            "audit_run_id": int(audit_run["id"]),
+            "controller_profile": controller,
+            "blocker": REVIEW_HANDOFF_MALFORMED_ENVELOPE_BLOCKER,
+            "handoff_reason_sha256": handoff_reason_sha256,
+            "author_target_status": author_target_status,
+        }
+        receipt_sha256 = hashlib.sha256(
+            json.dumps(
+                core_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        _append_event(
+            conn, author_task_id, REVIEW_HANDOFF_RECOVERY_EVENT_KIND,
+            {**core_payload, "receipt_sha256": receipt_sha256},
+        )
+        event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        return {**core_payload, "receipt_sha256": receipt_sha256, "event_id": event_id}
+
+
+def resume_reviewed_author(
+    conn: sqlite3.Connection,
+    *,
+    author_task_id: str,
+    audit_task_id: str,
+    review_handoff_event_id: int,
+) -> Optional[dict[str, Any]]:
+    """Public fail-closed wrapper for the reviewed-author resume transaction."""
+    try:
+        return _resume_reviewed_author(
+            conn,
+            author_task_id=author_task_id,
+            audit_task_id=audit_task_id,
+            review_handoff_event_id=review_handoff_event_id,
+        )
+    except _ReviewHandoffConflict:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
