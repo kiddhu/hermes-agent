@@ -6661,6 +6661,7 @@ def _has_protocol_violation_fence(conn: sqlite3.Connection, task_id: str) -> boo
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
     *, promoted_ids: Optional[list[str]] = None,
+    promoted_events: Optional[list[tuple[str, int, int]]] = None,
 ) -> int:
     """Promote tasks whose terminal or typed-review parents are satisfied.
 
@@ -6779,6 +6780,15 @@ def recompute_ready(
                 promoted += 1
                 if promoted_ids is not None:
                     promoted_ids.append(task_id)
+                if promoted_events is not None:
+                    event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                    event_created_at = int(
+                        conn.execute(
+                            "SELECT created_at FROM task_events WHERE id = ?",
+                            (event_id,),
+                        ).fetchone()[0]
+                    )
+                    promoted_events.append((task_id, event_id, event_created_at))
     return promoted
 
 
@@ -9323,12 +9333,745 @@ def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
     return {key: value[key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)}
 
 
+_JSON_STRUCTURAL_LEAD = ("{", "[", '"')
+# A closed JSON-value lead: a sign, a digit, or the initial of a JSON keyword
+# (true/false/null) or a Python float keyword (NaN/Infinity), case-insensitively.
+# Any leading such character routes the reason to the strict decoder, which
+# accepts ONLY the exact canonical envelope — so a scalar or malformed JSON-like
+# prefix (``0``, ``truex``, ``0x``, ``NaN``, ``Infinity``, ...) can never fall
+# through to the prose path and authenticate by a coincidental declaration.
+_JSON_VALUE_LEAD_RE = re.compile(r"[-+0-9tfnNI]", re.IGNORECASE)
+
+
+def _looks_json_shaped(text: str) -> bool:
+    """Return True when ``text`` leads with any JSON value or JSON-like token.
+
+    The discriminator is deliberately closed and over-permissive: a leading
+    structural character, number sign, digit, or JSON keyword initial routes to
+    the strict decoder. That decoder accepts ONLY the exact canonical envelope,
+    so any scalar or malformed JSON-like prefix (``NaN``, ``Infinity``, ``0x``,
+    ``truex``, ...) fails closed rather than being reinterpreted as prose.
+    """
+    if not text:
+        return False
+    if text[0] in _JSON_STRUCTURAL_LEAD:
+        return True
+    return _JSON_VALUE_LEAD_RE.match(text) is not None
+
+
+@dataclass(frozen=True)
+class _ProseHandoffCapabilityFinding:
+    """A prose review-handoff reason is a typed capability finding, not a
+    decodable envelope.
+
+    Free-form prose cannot be consumed by the finite closed JSON-envelope
+    adapter while rejecting arbitrary additions, so it is never decoded by
+    open-ended token inference. This frozen singleton is returned (distinct from
+    the generic ``None`` used for absent, malformed, or mismatched JSON input) so
+    a prose handoff — a recognized capability boundary — is observable as such
+    while still failing closed.
+    """
+
+
+_PROSE_HANDOFF_CAPABILITY_FINDING = _ProseHandoffCapabilityFinding()
+
+
+def _resolve_handoff_candidate_target(
+    reason: str, expected_candidate: dict[str, Any],
+) -> Any:
+    """Resolve the author's declared candidate from a review-handoff ``reason``.
+
+    The canonical (and sole supported) handoff format is the version-1 candidate
+    envelope ``{"version": 1, "candidate": {...}, "summary": ...}``.  This
+    decoder is finite, anchored, exact, and strictly typed: it accepts exactly
+    that one envelope shape — ``version`` the integer ``1``, ``candidate`` a
+    dict whose every value carries the exact same Python type and value as the
+    already-validated evidence, and ``summary`` a non-empty ``str`` — and
+    nothing else. Because the comparison is type-strict (not ``==``), a JSON
+    ``true``/``false`` or a float such as ``100.0`` can never alias the integer
+    fields and authenticate.
+
+    The return value is three-valued and typed:
+      * ``dict`` — the exact canonical envelope (the sole decodable input).
+      * ``_ProseHandoffCapabilityFinding`` — the reason is prose: a recognized
+        capability boundary that fails closed as a typed finding, never decoded.
+      * ``None`` — absent, malformed, duplicate-member, deeply-nested, or
+        otherwise non-canonical JSON input.
+    """
+    text = reason.strip()
+    if not _looks_json_shaped(text):
+        return _PROSE_HANDOFF_CAPABILITY_FINDING
+    try:
+        target = _strict_json_loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(target, dict) or set(target) != {"version", "candidate", "summary"}:
+        return None
+    if type(target.get("version")) is not int or target["version"] != 1:
+        return None
+    candidate = target.get("candidate")
+    if type(candidate) is not dict or set(candidate) != set(expected_candidate):
+        return None
+    for key, expected_value in expected_candidate.items():
+        if type(candidate.get(key)) is not type(expected_value) or candidate[key] != expected_value:
+            return None
+    if type(target.get("summary")) is not str or not target["summary"].strip():
+        return None
+    return target
+
+# Earlier-v3 envelope key set (pre-merge PR98 resident 95392cf8). The final
+# head accepts only the later v3 key set; this names the exact earlier shape so
+# a persisted authentic earlier-v3 receipt can be recognized without weakening
+# the later-v3 authority or mutating any historical byte.
+_EARLIER_V3_AUDIT_OUTCOME_KEYS = {
+    "version", "author_task_id", "author_run_id", "audit_task_id", "audit_run_id",
+    "handoff_event_id", "verdict", "reason", "evidence", "role_separation",
+    "evidence_sha256", "created_at",
+}
+_EARLIER_V3_AUDIT_ROLE_KEYS = {"author_profile", "auditor_profile"}
+_EARLIER_V3_DISPOSITION_FINAL = "FINAL_ACCEPTED"
+_EARLIER_V3_DISPOSITION_CONTINUATION = "CONTINUATION_COMMITTED"
+# The pre-merge v2 PASS review_verdict contract: exactly these seven keys,
+# version 2, verdict "pass", and evidence_sha256 recomputed over the closed
+# evidence block. Any unknown or missing key fails closed.
+_EARLIER_V3_VERDICT_KEYS = {
+    "version", "review_task_id", "review_run_id", "verdict", "reason",
+    "evidence", "evidence_sha256",
+}
+
+
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that fails closed on any repeated JSON member name.
+
+    ``json.loads`` keeps only the last duplicate member, so a raw authority
+    record that is not the authentic producer shape could collapse into the
+    expected key set and authenticate. ``json.loads`` applies this hook
+    recursively at every object level, so the first repeated member name raises
+    ``ValueError`` and the caller fails closed instead of trusting the collapsed
+    result.
+    """
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _strict_json_loads(raw: str) -> Any:
+    """Parse JSON while rejecting duplicate member names at every object level.
+
+    ``json.loads`` uses a recursive C decoder, so a deeply nested (or otherwise
+    adversarial) record raises ``RecursionError`` — a ``RuntimeError`` that the
+    call sites' ``except (TypeError, ValueError)`` fail-closed handlers do not
+    catch. Normalize it to ``ValueError`` here so a malformed authority record
+    can never crash reviewed-author resolution instead of failing closed.
+    """
+    try:
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_json_pairs)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting exceeds the safe decode depth") from exc
+
+
+def _canonical_audit_outcome_evidence_sha256(evidence: dict[str, Any]) -> str:
+    """Canonical JSON digest of the closed evidence block (earlier-v3 identity)."""
+    return hashlib.sha256(
+        json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _earlier_v3_changed_fact(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+) -> Optional[tuple[dict[str, Any], str]]:
+    """Read the one earlier-v3 changed-fact mirror for a task+run, if well-formed.
+
+    Requires a singleton: a second changed_fact on the exact task+run fails
+    closed so a hidden conflicting fact cannot be masked by a matching latest row.
+    Returns both the parsed record and its exact raw payload bytes so the caller
+    can enforce byte-identity between the author and audit mirrors.
+    """
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'changed_fact'",
+        (task_id, run_id),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    raw = rows[0]["payload"] or "{}"
+    try:
+        payload = _strict_json_loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if set(payload) != {
+        "task_id", "run_id", "prior_status", "new_status", "event_id",
+        "audit_outcome_sha256", "disposition", "continuation_task_ids",
+    }:
+        return None
+    return payload, raw
+
+
+def _earlier_v3_continuation_targets(
+    conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
+) -> tuple[Optional[str], Optional[list[str]]]:
+    """Recompute the earlier-v3 disposition + bound continuation target ids.
+
+    Mirrors the pre-merge resolver: the author's non-audit, non-terminal
+    children are the continuation targets. A child id that does not resolve to
+    a live task row fails closed.
+    """
+    rows = conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ? AND child_id != ?",
+        (author_task_id, audit_task_id),
+    ).fetchall()
+    targets: list[str] = []
+    for row in rows:
+        child_id = str(row["child_id"])
+        live = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (child_id,),
+        ).fetchone()
+        if live is None:
+            return None, None
+        if live["status"] in ("done", "archived"):
+            continue
+        targets.append(child_id)
+    targets.sort()
+    if targets:
+        return _EARLIER_V3_DISPOSITION_CONTINUATION, targets
+    return _EARLIER_V3_DISPOSITION_FINAL, []
+
+
+def _earlier_v3_bound_verdict(
+    payload: Any, audit_task_id: str, audit_run_id: int, envelope: dict[str, Any],
+) -> bool:
+    """Validate one bound pre-merge version-2 PASS review_verdict mirror.
+
+    The authentic producer wrote the exact seven-key v2 schema and recomputed
+    ``evidence_sha256`` over the closed evidence block. Any unknown/missing
+    key, wrong type, drift from the envelope, or a digest that does not
+    recompute over the closed evidence block fails closed so this ingress can
+    never trust a malformed or tampered authority record.
+    """
+    try:
+        verdict = _strict_json_loads(payload or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(verdict, dict) or set(verdict) != _EARLIER_V3_VERDICT_KEYS:
+        return False
+    if type(verdict.get("version")) is not int or verdict["version"] != 2:
+        return False
+    if type(verdict.get("verdict")) is not str or verdict["verdict"] != "pass":
+        return False
+    if (
+        type(verdict.get("review_task_id")) is not str
+        or verdict["review_task_id"] != audit_task_id
+    ):
+        return False
+    review_run_id = verdict.get("review_run_id")
+    if type(review_run_id) is not int or review_run_id != audit_run_id:
+        return False
+    reason = verdict.get("reason")
+    if type(reason) is not str or reason != envelope.get("reason"):
+        return False
+    evidence = verdict.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != _CANONICAL_AUDIT_EVIDENCE_KEYS:
+        return False
+    if _canonical_audit_evidence(evidence) != evidence:
+        return False
+    if evidence != envelope.get("evidence"):
+        return False
+    evidence_sha256 = verdict.get("evidence_sha256")
+    if (
+        type(evidence_sha256) is not str
+        or evidence_sha256 != _canonical_audit_outcome_evidence_sha256(evidence)
+    ):
+        return False
+    return True
+
+
+def _earlier_v3_current_audit_outcome(
+    conn: sqlite3.Connection, author_task_id: str, row: sqlite3.Row,
+    envelope: dict[str, Any],
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Validate one authentic earlier-v3 envelope and map it to the current receipt.
+
+    The pre-merge PR98 resident persisted the canonical audit-outcome envelope in
+    the earlier v3 key set. This read-only ingress validates that exact shape
+    (digest, role separation, direct review handoff, author/audit task+run, PASS)
+    and maps it in memory to the current semantic receipt so the existing
+    finalizer can terminalize the author. No historical byte is mutated and no
+    second outcome is emitted; any mixed-key, wrong digest/role/task/run/handoff,
+    or conflicting record fails closed (present=True, receipt=None).
+    """
+    if envelope.get("version") != 3 or envelope.get("verdict") != "PASS":
+        return True, None
+    if envelope.get("author_task_id") != author_task_id:
+        return True, None
+    evidence = envelope.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != _CANONICAL_AUDIT_EVIDENCE_KEYS:
+        return True, None
+    if _canonical_audit_evidence(evidence) != evidence:
+        return True, None
+    evidence_sha256 = envelope.get("evidence_sha256")
+    if (
+        not isinstance(evidence_sha256, str)
+        or evidence_sha256 != _canonical_audit_outcome_evidence_sha256(evidence)
+    ):
+        return True, None
+    if not isinstance(envelope.get("reason"), str) or not envelope["reason"].strip():
+        return True, None
+    envelope_created_at = envelope.get("created_at")
+    if (
+        isinstance(envelope_created_at, bool)
+        or not isinstance(envelope_created_at, int)
+        or envelope_created_at != row["created_at"]
+    ):
+        return True, None
+    role = envelope.get("role_separation")
+    if not isinstance(role, dict) or set(role) != _EARLIER_V3_AUDIT_ROLE_KEYS:
+        return True, None
+    author_profile = role.get("author_profile")
+    auditor_profile = role.get("auditor_profile")
+    if (
+        not isinstance(author_profile, str) or not author_profile
+        or not isinstance(auditor_profile, str) or not auditor_profile
+        or author_profile == auditor_profile
+    ):
+        return True, None
+    author_run_id = envelope.get("author_run_id")
+    audit_run_id = envelope.get("audit_run_id")
+    handoff_event_id = envelope.get("handoff_event_id")
+    audit_task_id = envelope.get("audit_task_id")
+    if (
+        not isinstance(audit_task_id, str) or not audit_task_id
+        or isinstance(author_run_id, bool) or not isinstance(author_run_id, int)
+        or isinstance(audit_run_id, bool) or not isinstance(audit_run_id, int)
+        or isinstance(handoff_event_id, bool) or not isinstance(handoff_event_id, int)
+    ):
+        return True, None
+    if audit_task_id != row["task_id"] or audit_run_id != row["run_id"]:
+        return True, None
+    audit_parents = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ?",
+        (audit_task_id,),
+    ).fetchall()
+    if len(audit_parents) != 1 or audit_parents[0]["parent_id"] != author_task_id:
+        return True, None
+    author_row = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (author_task_id,),
+    ).fetchone()
+    audit_row = conn.execute(
+        "SELECT status, assignee, current_run_id, factory_build_gate, "
+        "factory_terminal_receipt_sha256 FROM tasks WHERE id = ?",
+        (audit_task_id,),
+    ).fetchone()
+    if author_row is None or audit_row is None:
+        return True, None
+    if (
+        author_profile != author_row["assignee"]
+        or auditor_profile != audit_row["assignee"]
+        or author_row["assignee"] == audit_row["assignee"]
+    ):
+        return True, None
+    if author_row["status"] != "review" or author_row["current_run_id"] is not None:
+        return True, None
+    if audit_row["status"] not in {"done", "archived"} or audit_row["current_run_id"] is not None:
+        return True, None
+    if audit_row["factory_build_gate"] and (
+        not isinstance(audit_row["factory_terminal_receipt_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", audit_row["factory_terminal_receipt_sha256"]) is None
+    ):
+        return True, None
+    author_run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+        (author_run_id, author_task_id),
+    ).fetchone()
+    audit_run = conn.execute(
+        "SELECT profile, status, outcome, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+        (audit_run_id, audit_task_id),
+    ).fetchone()
+    if (
+        author_run is None or author_run["profile"] != author_profile
+        or (author_run["status"], author_run["outcome"]) != ("review_required", "review_required")
+        or author_run["ended_at"] is None
+    ):
+        return True, None
+    if (
+        audit_run is None or audit_run["profile"] != auditor_profile
+        or (audit_run["status"], audit_run["outcome"]) != ("done", "completed")
+        or audit_run["ended_at"] is None
+    ):
+        return True, None
+    # Freshness gate: the envelope must bind the LATEST author and audit runs.
+    # A newer terminal author run or a newer completed audit run makes this
+    # receipt stale, so the ingress fails closed rather than authenticating a
+    # superseded run identity.
+    latest_author_run = conn.execute(
+        "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (author_task_id,),
+    ).fetchone()[0]
+    latest_audit_run = conn.execute(
+        "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (audit_task_id,),
+    ).fetchone()[0]
+    if latest_author_run != author_run_id or latest_audit_run != audit_run_id:
+        return True, None
+    author_mirrors = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'canonical_audit_outcome'",
+        (author_task_id, author_run_id),
+    ).fetchall()
+    if len(author_mirrors) != 1:
+        return True, None
+    # The round-1 singleton requirement is byte-identity, not parsed-object
+    # equality: the authentic producer wrote the exact same serialized bytes to
+    # both task histories. Re-serializing the author mirror with a different
+    # key order (semantically equal but byte-different) must fail closed.
+    if author_mirrors[0]["payload"] != row["payload"]:
+        return True, None
+    # Bind the envelope back to the mirrored PASS review_verdict rows that
+    # actually granted the PASS, so this ingress corroborates the existing
+    # authority instead of acting as an alternate one. Removing either bound
+    # verdict row, or drifting the envelope's reason/evidence away from the
+    # verdict, fails closed.
+    audit_verdicts = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'review_verdict'",
+        (audit_task_id, audit_run_id),
+    ).fetchall()
+    author_verdicts = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'review_verdict'",
+        (author_task_id, audit_run_id),
+    ).fetchall()
+    if len(audit_verdicts) != 1 or len(author_verdicts) != 1:
+        return True, None
+    # The paired PASS review_verdict mirrors must be byte-identical: the
+    # authentic producer wrote the exact same serialized bytes to both
+    # histories, so a key-reordered (semantically equal) mirror fails closed.
+    if audit_verdicts[0]["payload"] != author_verdicts[0]["payload"]:
+        return True, None
+    # Validate each singleton bound PASS review_verdict against the exact
+    # pre-merge version-2 schema/types and the recomputed closed-evidence
+    # digest, and bind it back to the envelope reason/evidence. A tampered
+    # digest or an unknown/missing key fails closed (never an alternate
+    # authority over a present v3 record).
+    if (
+        not _earlier_v3_bound_verdict(
+            audit_verdicts[0]["payload"], audit_task_id, audit_run_id, envelope,
+        )
+        or not _earlier_v3_bound_verdict(
+            author_verdicts[0]["payload"], audit_task_id, audit_run_id, envelope,
+        )
+    ):
+        return True, None
+    handoff_row = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE id = ? AND task_id = ? "
+        "AND kind = 'review_handoff'",
+        (handoff_event_id, author_task_id),
+    ).fetchone()
+    # The bound review handoff participates in the earlier-v3 authentication
+    # chain; decode its raw bytes with duplicate-member rejection so a handoff
+    # whose raw JSON repeats a member name (e.g. ``version``) can never collapse
+    # into the expected shape and authenticate.
+    if handoff_row is not None:
+        try:
+            _strict_json_loads(handoff_row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return True, None
+    handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
+    if (
+        handoff is None
+        or handoff.review_task_id != audit_task_id
+        or handoff.expected_run_id != author_run_id
+    ):
+        return True, None
+    # Freshness gate: the bound handoff must be the LATEST review_handoff for
+    # the author. A later handoff (a re-issued review request) supersedes the
+    # bound one and makes this receipt stale.
+    latest_handoff_id = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'review_handoff'",
+        (author_task_id,),
+    ).fetchone()[0]
+    if latest_handoff_id != handoff_event_id:
+        return True, None
+    author_fact_raw = _earlier_v3_changed_fact(conn, author_task_id, author_run_id)
+    audit_fact_raw = _earlier_v3_changed_fact(conn, audit_task_id, audit_run_id)
+    if author_fact_raw is None or audit_fact_raw is None:
+        return True, None
+    author_fact, author_raw = author_fact_raw
+    audit_fact, audit_raw = audit_fact_raw
+    # The paired changed-fact mirrors must be byte-identical, not merely
+    # parse-equal: the authentic producer serialized the exact same bytes to
+    # both histories, so a key-reordered (semantically equal) mirror fails closed.
+    if author_raw != audit_raw or author_fact != audit_fact:
+        return True, None
+    fact = author_fact
+    if (
+        type(fact.get("task_id")) is not str or fact["task_id"] != audit_task_id
+        or type(fact.get("run_id")) is not int or fact["run_id"] != audit_run_id
+        or type(fact.get("event_id")) is not int or fact["event_id"] != row["id"]
+        or fact.get("prior_status") != "running"
+        or fact.get("new_status") != "done"
+        or fact.get("audit_outcome_sha256") != evidence_sha256
+    ):
+        return True, None
+    disposition = fact.get("disposition")
+    continuation_ids = fact.get("continuation_task_ids")
+    if disposition == _EARLIER_V3_DISPOSITION_FINAL:
+        if continuation_ids != []:
+            return True, None
+    elif disposition == _EARLIER_V3_DISPOSITION_CONTINUATION:
+        if not isinstance(continuation_ids, list) or not continuation_ids:
+            return True, None
+        seen: set[str] = set()
+        for cid in continuation_ids:
+            if not isinstance(cid, str) or not cid or cid in seen or cid == audit_task_id:
+                return True, None
+            seen.add(cid)
+            if conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (author_task_id, cid),
+            ).fetchone() is None:
+                return True, None
+    else:
+        return True, None
+    live_disposition, live_targets = _earlier_v3_continuation_targets(
+        conn, author_task_id, audit_task_id,
+    )
+    if live_disposition is None or live_disposition != disposition or continuation_ids != live_targets:
+        return True, None
+    receipt = {
+        "task_id": author_task_id,
+        "subject_id": f"{author_task_id}/{author_run_id}",
+        "subject_version_or_exact_hash": evidence_sha256,
+        "author_task_id": author_task_id,
+        "author_run_id": author_run_id,
+        "author_profile": author_profile,
+        "auditor_task_id": audit_task_id,
+        "auditor_run_id": audit_run_id,
+        "auditor_profile": auditor_profile,
+        "verdict": "PASS",
+        "issued_at": int(row["id"]),
+    }
+    receipt_hash = hashlib.sha256(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return True, {**receipt, "receipt_hash": receipt_hash, "authenticated": True}
+
+
+# The current-v3 (later-v3) PASS review_verdict contract written by the terminal
+# producer in the same transaction as the canonical_audit_outcome envelope:
+# exactly these six keys, version 2, verdict "pass", and reason/evidence bound
+# byte-for-byte to the envelope. Any unknown/missing key or drift fails closed.
+_CURRENT_V3_VERDICT_KEYS = {
+    "version", "review_task_id", "review_run_id", "verdict", "reason", "evidence",
+}
+
+
+def _current_v3_bound_verdict(
+    payload: Any, audit_task_id: str, audit_run_id: int, envelope: dict[str, Any],
+) -> bool:
+    """Validate the singleton current-v3 PASS review_verdict producer record.
+
+    The terminal producer writes the canonical_audit_outcome envelope and the
+    PASS review_verdict in the same transaction. Binding the envelope's
+    reason/evidence/task/run identity back to that exact verdict record prevents
+    a byte-drifted verdict claim (reason changed and self-digest/fact pointer
+    recomputed) from surviving readback.
+    """
+    try:
+        verdict = _strict_json_loads(payload or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(verdict, dict) or set(verdict) != _CURRENT_V3_VERDICT_KEYS:
+        return False
+    if type(verdict.get("version")) is not int or verdict["version"] != 2:
+        return False
+    if type(verdict.get("verdict")) is not str or verdict["verdict"] != "pass":
+        return False
+    if (
+        type(verdict.get("review_task_id")) is not str
+        or verdict["review_task_id"] != audit_task_id
+    ):
+        return False
+    if type(verdict.get("review_run_id")) is not int or verdict["review_run_id"] != audit_run_id:
+        return False
+    if type(verdict.get("reason")) is not str or verdict["reason"] != envelope.get("reason"):
+        return False
+    if verdict.get("evidence") != envelope.get("evidence"):
+        return False
+    return True
+
+
+def _current_v3_continuation_targets(
+    conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
+    audit_run_id: int, outcome_event_id: int, continuation_receipts: Any,
+) -> Optional[tuple[str, list[str]]]:
+    """Authenticate the closed immutable terminal-transaction promotion receipt.
+
+    The terminal producer does not emit a bare task-id set. It binds, for every
+    task its terminal ``recompute_ready`` actually promoted, the exact promoted
+    event identity — ``task_id`` + ``event_id`` + ``created_at`` — as an
+    immutable receipt inside the hashed envelope. The validator re-reads each
+    receipt entry's exact event row *by id* and fails closed on any divergence,
+    rather than reconstructing a partial task-id set from any row named
+    ``promoted``.
+
+    The lower boundary is the audit run's *singleton* ``completed`` marker: the
+    terminal transaction emits exactly one such marker, and its id must precede
+    the outcome. A missing, duplicate, or post-outcome same-run ``completed``
+    marker fails closed (returns ``None``).
+
+    The receipt is *closed and exact*:
+
+    * every receipt entry must be a strict ``{task_id, event_id, created_at}``
+      dict with an integer ``event_id``/``created_at`` and a non-empty string
+      ``task_id``; repeated task ids or event ids are ambiguous duplicates and
+      fail closed;
+    * the terminal window ``(completed_id, outcome_event_id)`` must contain
+      exactly the receipt's promoted events — no extra synthetic row and no
+      missing producer row;
+    * each bound event must be canonically shaped (``run_id IS NULL`` and
+      ``payload IS NULL``) and its ``created_at`` must still be the exact
+      integer the producer recorded (a mutated TEXT ``created_at`` fails
+      closed);
+    * each bound task must still exist, be ``ready``, and have been *created*
+      as ``todo``/``blocked`` (``recompute_ready`` only ever promotes a
+      ``todo``/``blocked`` task), so a synthetic promotion of an already-ready
+      or nonexistent task cannot masquerade as the producer's causal output.
+    """
+    if type(continuation_receipts) is not list:
+        return None
+    completed_rows = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'completed'",
+        (audit_task_id, audit_run_id),
+    ).fetchall()
+    if len(completed_rows) != 1:
+        return None
+    lower = int(completed_rows[0]["id"])
+    if lower >= outcome_event_id:
+        return None
+    # Index the receipt by event id, rejecting any malformed or ambiguous entry
+    # up front so the terminal window comparison below is a true bijection.
+    receipt_by_event: dict[int, dict[str, Any]] = {}
+    seen_task: set[str] = set()
+    for entry in continuation_receipts:
+        if not isinstance(entry, dict) or set(entry) != {"task_id", "event_id", "created_at"}:
+            return None
+        task_id = entry.get("task_id")
+        event_id = entry.get("event_id")
+        created_at = entry.get("created_at")
+        if type(task_id) is not str or not task_id:
+            return None
+        if type(event_id) is not int or type(created_at) is not int:
+            return None
+        if task_id in seen_task or event_id in receipt_by_event:
+            return None
+        seen_task.add(task_id)
+        receipt_by_event[event_id] = entry
+    window_rows = conn.execute(
+        "SELECT id, task_id, run_id, payload, created_at FROM task_events "
+        "WHERE kind = 'promoted' AND id > ? AND id < ? ORDER BY id",
+        (lower, outcome_event_id),
+    ).fetchall()
+    if len(window_rows) != len(receipt_by_event):
+        return None
+    targets: list[str] = []
+    for row in window_rows:
+        event_id = int(row["id"])
+        entry = receipt_by_event.get(event_id)
+        if entry is None:
+            # An extra promoted event inside the terminal window that the
+            # producer's receipt does not bind is a synthetic injection.
+            return None
+        if row["run_id"] is not None or row["payload"] is not None:
+            return None
+        if row["task_id"] != entry["task_id"]:
+            return None
+        if type(row["created_at"]) is not int or int(row["created_at"]) != entry["created_at"]:
+            return None
+        task_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (entry["task_id"],),
+        ).fetchone()
+        if task_row is None or task_row["status"] != "ready":
+            return None
+        created = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+            "ORDER BY id LIMIT 1",
+            (entry["task_id"],),
+        ).fetchone()
+        if created is None:
+            return None
+        try:
+            created_obj = _strict_json_loads(created["payload"] or "{}")
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(created_obj, dict) or created_obj.get("status") not in ("todo", "blocked"):
+            return None
+        targets.append(entry["task_id"])
+    targets.sort()
+    if targets:
+        return _EARLIER_V3_DISPOSITION_CONTINUATION, targets
+    return _EARLIER_V3_DISPOSITION_FINAL, []
+
+
+def _current_v3_continuation_ids_valid(
+    conn: sqlite3.Connection, author_task_id: str, audit_task_id: str,
+    audit_run_id: int, continuation_ids: Any, disposition: Any,
+    outcome_event_id: int, continuation_receipts: Any,
+) -> bool:
+    """Validate the current-v3 continuation list against the immutable
+    terminal-transaction promotion fact.
+
+    Each continuation id must be a unique, nonempty string that is neither the
+    author nor the audit task, and the disposition must match the list's
+    emptiness. The list must match the durable terminal-transaction promoted set
+    exactly, so a drifted envelope that invents a task with no producer
+    promotion, or erases a producer-promoted task, fails closed even after its
+    digest and fact pointer are recomputed. Present-day ``task_links`` or
+    ``tasks`` relationship/status state is never consulted: the immutable
+    promotion events are the sole authority, so supported post-outcome
+    link/unlink evolution cannot erase an intact producer promotion.
+    """
+    if type(continuation_ids) is not list:
+        return False
+    if disposition == "FINAL_ACCEPTED":
+        if continuation_ids != []:
+            return False
+    elif disposition == "CONTINUATION_COMMITTED":
+        if not continuation_ids:
+            return False
+    else:
+        return False
+    seen: set[str] = set()
+    for cid in continuation_ids:
+        if type(cid) is not str or not cid or cid in seen:
+            return False
+        seen.add(cid)
+        if cid in {author_task_id, audit_task_id}:
+            return False
+    live = _current_v3_continuation_targets(
+        conn, author_task_id, audit_task_id, audit_run_id, outcome_event_id,
+        continuation_receipts,
+    )
+    if live is None:
+        return False
+    live_disposition, live_targets = live
+    if live_disposition != disposition or continuation_ids != live_targets:
+        return False
+    return True
+
+
 def _canonical_current_audit_outcome(
     conn: sqlite3.Connection, author_task_id: str,
 ) -> tuple[bool, Optional[dict[str, Any]]]:
     """Resolve the strict audit-owned singleton; presence blocks legacy fallback."""
     rows = conn.execute(
-        "SELECT e.id, e.task_id, e.run_id, e.payload FROM task_events e "
+        "SELECT e.id, e.task_id, e.run_id, e.payload, e.created_at FROM task_events e "
         "JOIN task_links l ON l.child_id=e.task_id AND l.parent_id=? "
         "WHERE e.kind='canonical_audit_outcome' ORDER BY e.id", (author_task_id,),
     ).fetchall()
@@ -9338,7 +10081,14 @@ def _canonical_current_audit_outcome(
         return True, None
     row = rows[0]
     try:
-        envelope = json.loads(row["payload"] or "{}")
+        envelope = _strict_json_loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return True, None
+    if not isinstance(envelope, dict):
+        return True, None
+    if set(envelope) == _EARLIER_V3_AUDIT_OUTCOME_KEYS:
+        return _earlier_v3_current_audit_outcome(conn, author_task_id, row, envelope)
+    try:
         payload = {key: value for key, value in envelope.items() if key != "envelope_sha256"}
         digest = envelope["envelope_sha256"]
     except (AttributeError, KeyError, TypeError, ValueError):
@@ -9348,9 +10098,28 @@ def _canonical_current_audit_outcome(
         "SELECT id, run_id, payload FROM task_events WHERE id=? AND task_id=? AND kind='review_handoff'",
         (payload.get("review_handoff_event_id"), author_task_id),
     ).fetchone()
+    # The bound review handoff participates in the current-v3 authentication
+    # chain; decode its raw bytes with duplicate-member rejection so a handoff
+    # whose raw JSON repeats a member name (e.g. ``version``) can never collapse
+    # into the expected shape and authenticate (mirrors the earlier-v3 ingress).
+    if handoff_row is not None:
+        try:
+            _strict_json_loads(handoff_row["payload"] or "{}")
+        except (TypeError, ValueError):
+            return True, None
     handoff = _review_handoff_receipt_from_row(author_task_id, handoff_row) if handoff_row else None
-    try: target = json.loads(handoff.reason) if handoff is not None else None
-    except (TypeError, ValueError): target = None
+    evidence = payload.get("evidence")
+    expected_candidate = (
+        {key: evidence[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
+        if isinstance(evidence, dict) else {}
+    )
+    candidate_bound = (
+        handoff is not None
+        and isinstance(
+            _resolve_handoff_candidate_target(handoff.reason, expected_candidate),
+            dict,
+        )
+    )
     task = conn.execute(
         "SELECT status, assignee, current_run_id, factory_build_gate, "
         "factory_terminal_receipt_sha256 FROM tasks WHERE id=?", (row["task_id"],),
@@ -9369,22 +10138,42 @@ def _canonical_current_audit_outcome(
     ).fetchone()
     parents = conn.execute("SELECT parent_id FROM task_links WHERE child_id=?",
                            (row["task_id"],),).fetchall()
+    # Freshness gates: the authoritative later-v3 receipt must bind the LATEST
+    # author run, audit run, and review handoff. A newer terminal author run, a
+    # newer completed audit run, or a later re-issued handoff makes this receipt
+    # stale, so the readback fails closed rather than authenticating a
+    # superseded run/handoff identity (mirrors the earlier-v3 ingress).
+    latest_author_run = conn.execute(
+        "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (author_task_id,),
+    ).fetchone()[0]
+    latest_audit_run = conn.execute(
+        "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (row["task_id"],),
+    ).fetchone()[0]
+    latest_handoff_id = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'review_handoff'",
+        (author_task_id,),
+    ).fetchone()[0]
     required = {
         "version", "author_task_id", "author_run_id", "author_profile", "audit_task_id",
         "audit_run_id", "auditor_profile", "review_handoff_event_id", "verdict", "reason",
-        "evidence", "scope", "disposition", "continuation_ids",
+        "evidence", "scope", "disposition", "continuation_ids", "continuation_receipts",
     }
     continuation_ids = payload.get("continuation_ids")
+    continuation_receipts = payload.get("continuation_receipts")
+    verdict_rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='review_verdict'",
+        (row["task_id"], row["run_id"]),
+    ).fetchall()
     valid = (
-        set(payload) == required and payload.get("version") == 3
+        set(payload) == required and type(payload.get("version")) is int and payload.get("version") == 3
+        and type(payload.get("author_run_id")) is int
+        and type(payload.get("audit_run_id")) is int
+        and type(payload.get("review_handoff_event_id")) is int
         and payload.get("author_task_id") == author_task_id
         and payload.get("audit_task_id") == row["task_id"] and payload.get("audit_run_id") == row["run_id"]
         and payload.get("verdict") == "PASS" and payload.get("scope") == "audit_obligation"
         and _canonical_audit_evidence(payload.get("evidence")) == payload.get("evidence")
-        and isinstance(target, dict) and target == {"version": 1, "candidate": {
-            key: payload["evidence"][key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)
-        }, "summary": target.get("summary")}
-        and type(target["summary"]) is str and bool(target["summary"].strip())
+        and candidate_bound
         and type(payload.get("reason")) is str and bool(payload["reason"].strip())
         and type(digest) is str and hashlib.sha256(encoded).hexdigest() == digest
         and handoff is not None and handoff.review_task_id == row["task_id"]
@@ -9407,21 +10196,33 @@ def _canonical_current_audit_outcome(
         and task["current_run_id"] is None and task["assignee"] == payload.get("auditor_profile")
         and run is not None and run["profile"] == payload.get("auditor_profile")
         and (run["status"], run["outcome"]) == ("done", "completed") and run["ended_at"] is not None
-        and type(continuation_ids) is list and all(type(item) is str for item in continuation_ids)
-        and payload.get("disposition") == (
-            "CONTINUATION_COMMITTED" if continuation_ids else "FINAL_ACCEPTED"
+        and _current_v3_continuation_ids_valid(
+            conn, author_task_id, row["task_id"], row["run_id"], continuation_ids,
+            payload.get("disposition"), row["id"], continuation_receipts,
         )
         and len(facts) == 1
+        and len(verdict_rows) == 1
+        and _current_v3_bound_verdict(
+            verdict_rows[0]["payload"], row["task_id"], row["run_id"], payload,
+        )
+        and latest_author_run == payload.get("author_run_id")
+        and latest_audit_run == row["run_id"]
+        and latest_handoff_id == payload.get("review_handoff_event_id")
     )
     try:
-        fact = json.loads(facts[0]["payload"]) if len(facts) == 1 else None
+        fact = _strict_json_loads(facts[0]["payload"] or "{}") if len(facts) == 1 else None
     except (TypeError, ValueError):
         fact = None
-    if fact != {
-        "version": 1, "type": "canonical_audit_outcome_pointer",
-        "outcome_event_id": int(row["id"]), "envelope_sha256": digest,
-        "prior_status": "running", "new_status": "done",
-    }:
+    if (
+        not isinstance(fact, dict)
+        or type(fact.get("version")) is not int or fact.get("version") != 1
+        or fact.get("type") != "canonical_audit_outcome_pointer"
+        or type(fact.get("outcome_event_id")) is not int
+        or fact.get("outcome_event_id") != int(row["id"])
+        or fact.get("envelope_sha256") != digest
+        or fact.get("prior_status") != "running"
+        or fact.get("new_status") != "done"
+    ):
         valid = False
     if not valid:
         return True, None
@@ -9477,8 +10278,14 @@ def _terminalize_review_pass(
         {"result_len": len(reason), "summary": reason[:400]}, run_id=audit_run_id,
     )
     promoted: list[str] = []
-    recompute_ready(conn, promoted_ids=promoted)
+    promoted_events: list[tuple[str, int, int]] = []
+    recompute_ready(conn, promoted_ids=promoted, promoted_events=promoted_events)
     promoted.sort()
+    promoted_events.sort(key=lambda entry: entry[0])
+    continuation_receipts = [
+        {"task_id": task_id, "event_id": event_id, "created_at": created_at}
+        for (task_id, event_id, created_at) in promoted_events
+    ]
     core = {
         "version": 3, "author_task_id": author_task_id, "author_run_id": receipt.expected_run_id,
         "author_profile": author["assignee"], "audit_task_id": audit_task_id,
@@ -9487,6 +10294,7 @@ def _terminalize_review_pass(
         "evidence": evidence, "scope": "audit_obligation",
         "disposition": "CONTINUATION_COMMITTED" if promoted else "FINAL_ACCEPTED",
         "continuation_ids": promoted,
+        "continuation_receipts": continuation_receipts,
     }
     digest = hashlib.sha256(
         json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -9653,14 +10461,13 @@ def _record_review_verdict(
             if parent_ids(conn, review_task_id) != [task_id] or handoff is None:
                 return False
             receipt = _review_handoff_receipt_from_row(task_id, handoff)
-            try:
-                target = json.loads(receipt.reason) if receipt is not None else None
-            except (TypeError, ValueError):
-                return False
             expected = {key: normalized_evidence[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)}
-            if not isinstance(target, dict) or target != {
-                "version": 1, "candidate": expected, "summary": target.get("summary")
-            } or type(target["summary"]) is not str or not target["summary"].strip():
+            if (
+                receipt is None
+                or not isinstance(
+                    _resolve_handoff_candidate_target(receipt.reason, expected), dict,
+                )
+            ):
                 return False
             return _terminalize_review_pass(
                 conn, author_task_id=task_id, audit_task_id=review_task_id,
