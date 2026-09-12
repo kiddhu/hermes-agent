@@ -1112,7 +1112,36 @@ def _reap_worker_descendants(
 # summaries). Values chosen to fit a typical 100k-char LLM prompt with
 # plenty of headroom. Each constant is tuned independently so users
 # who need to relax one don't have to relax all of them.
-_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+#
+# Prior attempts are age-bounded: only the SINGLE most-recent ordinary prior
+# run is rendered in full (the "latest exact run / evidence" a retry worker
+# must build on). Older ordinary runs are superseded history and collapse to a
+# one-line outcome marker, so a retry-heavy task cannot let superseded
+# terminal summaries dominate the assembled prompt. Review findings are NOT
+# collapsed: only the SINGLE most-recent ``request_changes`` verdict is the
+# unresolved finding and is preserved in full; every EARLIER ``request_changes``
+# verdict is a prior review finding that this schema cannot prove closed or
+# carried forward, so it is rendered as a machine-addressable reference (exact
+# task/run/outcome + stable content digest) instead of being dropped (see
+# build_worker_context and _run_content_digest). Keep this at 1 unless a
+# concrete need for a multi-attempt detail window exists.
+#
+# Prior-review references have TWO hard total bounds so a review-heavy task
+# cannot blow past the prompt budget: a count cap
+# (_CTX_MAX_PRIOR_REVIEW_REFS) AND a total byte budget
+# (_CTX_MAX_PRIOR_REVIEW_REF_BYTES). Each reference interpolates run.profile,
+# which is operator-controlled and unbounded, so the count cap alone is NOT a
+# byte bound; the profile field is therefore framed through _sanitize_inline
+# (newlines/control chars collapsed, capped at
+# _CTX_PRIOR_REVIEW_REF_PROFILE_CHARS) and the whole ref block is additionally
+# clamped to a hard byte budget (oldest findings drop first). Findings beyond
+# either bound are not deleted — their full text stays in the Native
+# ``task_runs`` record (the existing machine-retrievable surface) and the
+# projection emits a one-line omission marker.
+_CTX_MAX_PRIOR_ATTEMPTS = 1       # most recent N ordinary prior runs shown in full
+_CTX_MAX_PRIOR_REVIEW_REFS = 20   # most recent N prior review findings shown as digest refs
+_CTX_PRIOR_REVIEW_REF_PROFILE_CHARS = 64      # per-ref profile field cap (bounded framing)
+_CTX_MAX_PRIOR_REVIEW_REF_BYTES = 16 * 1024   # hard total byte budget for the inline ref block
 _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
@@ -1154,6 +1183,64 @@ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
         return f"{h}h ago"
     d = delta // 86400
     return f"{d}d ago"
+
+
+def _sanitize_inline(s: Optional[str], limit: int) -> str:
+    """Collapse control/newline characters and truncate ``s`` to ``limit``
+    characters for safe single-line framing.
+
+    ``run.profile`` is operator-controlled and unbounded, so interpolating it
+    verbatim into a prior-review reference line lets a hostile long/newline
+    value inflate the line (breaking the count-is-byte-bound invariant) or
+    inject newlines that escape the single-line framing. Collapse every ASCII
+    control char (newlines, tabs, NUL) to a single space, squeeze whitespace
+    runs, then hard-truncate to ``limit`` chars with a visible ellipsis so the
+    field stays a bounded, single-line token.
+    """
+    if not s:
+        return "(unknown)"
+    collapsed = re.sub(r"[\x00-\x1f\x7f]+", " ", s).strip()
+    collapsed = re.sub(r"\s+", " ", collapsed)
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit] + "…"
+
+
+def _run_content_digest(run: Run) -> str:
+    """Stable SHA-256 content digest of a run's immutable evidence payload
+    (summary + error + metadata).
+
+    Used by :func:`build_worker_context` to render prior ``request_changes``
+    findings as machine-addressable references without re-injecting their full
+    text into the worker prompt. The digest is deterministic for identical run
+    content, so an auditor can recompute it against the Native ``task_runs``
+    row to verify the evidence is intact and unchanged. The full text itself
+    stays in the run record (the existing Native surface); the prompt only
+    carries this digest, which bounds injected bytes WITHOUT deleting,
+    rewriting, or weakening the finding.
+
+    Serialization is a *canonical, injective* JSON object (``sort_keys=True``,
+    compact separators). JSON string escaping is unambiguous, so two distinct
+    ``(summary, error, metadata)`` triples can never share a digest — unlike a
+    raw delimiter join, which is not injective when the delimiter itself can
+    appear inside a field (e.g. a summary containing an embedded separator
+    sequence). Values are serialized *presence-preserving*: ``summary`` /
+    ``error`` / ``metadata`` are written as-is (``None`` stays ``null``), never
+    collapsed through ``or ""`` / ``or None``, because the Native path can
+    persist ``summary=NULL`` vs ``summary=''`` and ``metadata=None`` vs
+    ``metadata={}`` as distinct rows that must not share one content address.
+    """
+    payload = json.dumps(
+        {
+            "summary": run.summary,
+            "error": run.error,
+            "metadata": run.metadata,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -19633,8 +19720,19 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     Order:
       1. Task title (mandatory).
       2. Task body (optional opening post, capped at 8 KB).
-      3. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
-         shown; older attempts collapsed into a one-line summary).
+      3. Prior attempts on THIS task. Ordinary history is age-bounded to the
+         most recent ``_CTX_MAX_PRIOR_ATTEMPTS`` runs shown in full; older
+         ordinary runs collapse into a one-line superseded marker (count +
+         outcome distribution) without re-injecting their full text. Review
+         findings are never collapsed: the single most-recent unresolved
+         review finding (outcome ``request_changes``) is immutable review
+         evidence and is rendered in full, while every EARLIER
+         ``request_changes`` verdict is rendered as a machine-addressable
+         reference (exact run id + outcome + stable content digest) so no
+         finding is dropped; its full text stays in the run record. The
+         inline references are themselves hard-bounded to the most recent
+         ``_CTX_MAX_PRIOR_REVIEW_REFS`` (older findings collapse to a marker,
+         their full text remaining in the Native run record).
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
       4. Structured handoff results of every done parent task. Prefers
@@ -19715,33 +19813,135 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
     # Prior attempts — show closed runs so a retrying worker sees the
     # history. Skip the currently-active run (that's this worker).
-    # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
-    # attempts get collapsed into a one-line marker so the worker knows
-    # more exist without bloating the prompt.
+    #
+    # Two classes of closed history render differently:
+    #   * Review findings (outcome == ``request_changes``). The SINGLE
+    #     most-recent verdict is the unresolved finding a worker must still
+    #     re-test and is rendered in full. Every EARLIER verdict is a prior
+    #     review finding that this schema cannot prove closed or carried
+    #     forward (the run model has no closure bit / carry-forward relation),
+    #     so instead of dropping it we render a compact machine-addressable
+    #     reference (exact run id + outcome + stable content digest). The full
+    #     finding text stays in the run record (the existing Native surface)
+    #     and is NOT deleted or rewritten — prompt indirection bounds injected
+    #     bytes, it does not weaken evidence. No finding is marked closed or
+    #     superseded.
+    #   * Ordinary history (every other closed run) is age-bounded: only the
+    #     most-recent _CTX_MAX_PRIOR_ATTEMPTS runs render in full (summary /
+    #     error / metadata); older ordinary runs are SUPERSEDED and collapse
+    #     to a one-line marker (count + outcome distribution) WITHOUT
+    #     re-injecting their full text. This keeps retry-heavy tasks bounded
+    #     so superseded terminal summaries cannot dominate the assembled
+    #     prompt, while the latest outcome a retry must build on is never
+    #     dropped.
     all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
-    # list_runs returns ascending by started_at; "most recent" = last N
-    if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
-        omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
-        shown = all_prior[-_CTX_MAX_PRIOR_ATTEMPTS:]
-        first_shown_idx = omitted + 1
+    # list_runs returns ascending by started_at; "most recent" = last N.
+    index_by_id = {r.id: i + 1 for i, r in enumerate(all_prior)}
+
+    def _outcome(run: Run) -> str:
+        return run.outcome or run.status or "unknown"
+
+    review_findings = [r for r in all_prior if _outcome(r) == "request_changes"]
+    unresolved_rc = review_findings[-1:] if review_findings else []
+    prior_review_refs = review_findings[:-1] if review_findings else []
+
+    ordinary = [r for r in all_prior if _outcome(r) != "request_changes"]
+    if len(ordinary) > _CTX_MAX_PRIOR_ATTEMPTS:
+        superseded_ordinary = ordinary[:-_CTX_MAX_PRIOR_ATTEMPTS]
+        shown_ordinary = ordinary[-_CTX_MAX_PRIOR_ATTEMPTS:]
     else:
-        omitted = 0
-        shown = all_prior
-        first_shown_idx = 1
-    if shown:
+        superseded_ordinary = []
+        shown_ordinary = ordinary
+
+    # Full-detail runs: the latest unresolved review finding + the recent
+    # ordinary window, in chronological order.
+    shown = unresolved_rc + shown_ordinary
+    shown.sort(key=lambda r: index_by_id[r.id])
+
+    if shown or prior_review_refs or superseded_ordinary:
         lines.append("## Prior attempts on this task")
-        if omitted:
-            lines.append(
-                f"_({omitted} earlier attempt{'s' if omitted != 1 else ''} "
-                f"omitted; showing most recent {len(shown)})_"
+
+        if superseded_ordinary:
+            outcome_counts: dict[str, int] = {}
+            for run in superseded_ordinary:
+                label = _outcome(run)
+                outcome_counts[label] = outcome_counts.get(label, 0) + 1
+            distribution = ", ".join(
+                f"{label} x{count}"
+                for label, count in sorted(outcome_counts.items())
             )
-        for offset, run in enumerate(shown):
-            idx = first_shown_idx + offset
+            lines.append(
+                f"_({len(superseded_ordinary)} earlier attempt"
+                f"{'s' if len(superseded_ordinary) != 1 else ''} superseded: "
+                f"{distribution})_"
+            )
+
+        if prior_review_refs:
+            lines.append(
+                "_Earlier `request_changes` findings are preserved as "
+                "machine-addressable references (exact run id + outcome + "
+                "content digest); their full text remains in each run record "
+                "and is not deleted here. No finding is marked closed or "
+                "superseded — closure requires an exact lifecycle relation "
+                "this schema does not assert, so any closure is treated as "
+                "ambiguous and the finding stays addressable._"
+            )
+            # Hard bounded projection: keep the most-recent earlier findings,
+            # dropping the oldest first, clamped by BOTH a count cap
+            # (_CTX_MAX_PRIOR_REVIEW_REFS) and a total byte budget
+            # (_CTX_MAX_PRIOR_REVIEW_REF_BYTES). Each reference interpolates
+            # run.profile through _sanitize_inline (newline/control collapse +
+            # char cap) so the count cap is an actual byte bound and a hostile
+            # long/newline profile cannot inflate or inject lines. Findings
+            # beyond either bound are NOT deleted — their full text stays in
+            # the Native ``task_runs`` record and is summarised by a one-line
+            # omission marker.
+            kept_refs: list[str] = []  # rendered reference lines, newest first
+            budget_used = 0
+            omitted_refs = 0
+            for run in reversed(prior_review_refs):  # newest first
+                idx = index_by_id[run.id]
+                ts = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(run.started_at)
+                )
+                age = _relative_age(run.started_at, _now)
+                ts_disp = f"{ts}, {age}" if age else ts
+                profile = _sanitize_inline(
+                    run.profile, _CTX_PRIOR_REVIEW_REF_PROFILE_CHARS
+                )
+                digest = _run_content_digest(run)
+                ref = (
+                    f"- attempt {idx} (run #{run.id}, {profile}, {ts_disp}) — "
+                    f"request_changes — digest sha256:{digest}"
+                )
+                if len(kept_refs) >= _CTX_MAX_PRIOR_REVIEW_REFS:
+                    omitted_refs += 1
+                    continue
+                if budget_used + len(ref.encode("utf-8")) > _CTX_MAX_PRIOR_REVIEW_REF_BYTES:
+                    omitted_refs += 1
+                    continue
+                kept_refs.append(ref)
+                budget_used += len(ref.encode("utf-8"))
+            # Restore chronological (ascending) order for readability.
+            lines.extend(reversed(kept_refs))
+            if omitted_refs:
+                lines.append(
+                    f"_({omitted_refs} earlier review finding"
+                    f"{'s' if omitted_refs != 1 else ''} omitted from the "
+                    f"inline reference list to keep this projection bounded; "
+                    f"their full text and run ids remain retrievable from the "
+                    f"Native task_runs records and are not deleted here.)_"
+                )
+
+        for run in shown:
+            idx = index_by_id[run.id]
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
             age = _relative_age(run.started_at, _now)
             ts_disp = f"{ts}, {age}" if age else ts
-            profile = run.profile or "(unknown)"
-            outcome = run.outcome or run.status
+            profile = _sanitize_inline(
+                run.profile, _CTX_PRIOR_REVIEW_REF_PROFILE_CHARS
+            )
+            outcome = _outcome(run)
             lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})")
             if run.summary and run.summary.strip():
                 lines.append(_cap(run.summary))
