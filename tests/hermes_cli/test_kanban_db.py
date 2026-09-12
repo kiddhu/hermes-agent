@@ -6686,6 +6686,64 @@ def test_review_verdict_request_changes_resumes_same_author_task(kanban_home):
         assert second_review_claim.current_run_id != review_claim.current_run_id
 
 
+def test_review_verdict_latest_same_child_pass_supersedes_request_changes(kanban_home):
+    with kb.connect() as conn:
+        author, run_id, review_task = _review_handoff_pair(conn)
+        first_evidence = dict(_APPROVED_EVIDENCE)
+        first_handoff = json.dumps({
+            "version": 1,
+            "candidate": {
+                key: first_evidence[key]
+                for key in ("repository", "pr", "head", "tree", "base")
+            },
+            "summary": "first candidate",
+        }, sort_keys=True, separators=(",", ":"))
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=run_id,
+            review_task_id=review_task, reason=first_handoff,
+        )
+        first_audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=first_audit_run,
+            verdict="request_changes", reason="repair the candidate",
+        )
+
+        author_claim = kb.claim_task(conn, author)
+        assert author_claim is not None and author_claim.current_run_id is not None
+        second_evidence = {
+            **first_evidence,
+            "head": "d" * 40,
+            "tree": "e" * 40,
+            "github_review_id": 456,
+            "github_review_url": (
+                "https://github.com/kiddhu/hermes-agent/pull/98"
+                "#pullrequestreview-456"
+            ),
+        }
+        second_handoff = json.dumps({
+            "version": 1,
+            "candidate": {
+                key: second_evidence[key]
+                for key in ("repository", "pr", "head", "tree", "base")
+            },
+            "summary": "repaired candidate",
+        }, sort_keys=True, separators=(",", ":"))
+        assert kb.request_review_handoff(
+            conn, author, expected_run_id=author_claim.current_run_id,
+            review_task_id=review_task, reason=second_handoff,
+        )
+        second_audit_run = kb.claim_task(conn, review_task).current_run_id
+        assert second_audit_run != first_audit_run
+
+        assert kb.record_review_verdict(
+            conn, author, review_task_id=review_task,
+            expected_review_run_id=second_audit_run,
+            verdict="pass", reason="exact repaired head approved",
+            evidence=second_evidence,
+        )
+
+
 def test_review_verdict_pass_without_evidence_fails_without_mutation(kanban_home):
     with kb.connect() as conn:
         author, run_id, review_task = _review_handoff_pair(conn)
