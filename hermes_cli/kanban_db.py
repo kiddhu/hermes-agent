@@ -5045,6 +5045,132 @@ def set_model_override(
         return True
 
 
+def compare_and_set_model_override(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_task_id: str,
+    expected_model: Optional[str],
+    expected_provider: Optional[str],
+    model: Optional[str],
+    provider: Optional[str],
+) -> str:
+    """Atomically migrate one idle task's exact model/provider binding.
+
+    This is the fail-closed recovery counterpart to :func:`set_model_override`.
+    The caller must independently repeat the intended task id, the authenticated
+    ``HERMES_PROFILE`` must be that task's current assignee, the task must have
+    no active run, and both old binding fields must match. Replaying the same
+    old-to-new request is a no-op only when its prior event receipt matches.
+
+    Returns ``"updated"`` or ``"already_applied"``. Every failed precondition
+    raises before either the task row or event history is mutated.
+    """
+    task_id = (task_id or "").strip()
+    expected_task_id = (expected_task_id or "").strip()
+    if not expected_task_id or task_id != expected_task_id:
+        raise ValueError(
+            f"model override CAS expected task {expected_task_id!r}, got {task_id!r}"
+        )
+    expected_model = (expected_model or "").strip() or None
+    expected_provider = (expected_provider or "").strip() or None
+    model = (model or "").strip() or None
+    provider = (provider or "").strip() or None
+    if expected_provider and not expected_model:
+        raise ValueError("expected_provider requires expected_model")
+    if provider and not model:
+        raise ValueError("provider_override requires a model_override")
+
+    actor = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not actor:
+        raise PermissionError(
+            "model override CAS requires an authenticated HERMES_PROFILE"
+        )
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT assignee, status, current_run_id, model_override, "
+            "provider_override FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"no such task: {task_id}")
+        if row["assignee"] != actor:
+            raise PermissionError(
+                f"model override CAS requires current assignee {row['assignee']!r}; "
+                f"authenticated profile is {actor!r}"
+            )
+        if row["status"] == "archived":
+            raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        if row["current_run_id"] is not None:
+            raise RuntimeError(
+                f"cannot migrate model override while task {task_id} has active run "
+                f"{row['current_run_id']}"
+            )
+
+        current = (row["model_override"], row["provider_override"])
+        desired = (model, provider)
+        if current == desired:
+            receipt_rows = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'model_override_cas' "
+                "ORDER BY id DESC",
+                (expected_task_id,),
+            ).fetchall()
+            for receipt_row in receipt_rows:
+                try:
+                    receipt = json.loads(receipt_row["payload"] or "null")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(receipt, dict) and all((
+                    receipt.get("actor") == actor,
+                    receipt.get("old_model") == expected_model,
+                    receipt.get("old_provider") == expected_provider,
+                    receipt.get("model") == model,
+                    receipt.get("provider") == provider,
+                )):
+                    return "already_applied"
+            raise RuntimeError(
+                "model override CAS mismatch for "
+                f"{task_id}: desired binding is present without a matching "
+                "prior CAS receipt"
+            )
+        expected = (expected_model, expected_provider)
+        if current != expected:
+            raise RuntimeError(
+                "model override CAS mismatch for "
+                f"{task_id}: expected provider={expected_provider!r} "
+                f"model={expected_model!r}, found provider={current[1]!r} "
+                f"model={current[0]!r}"
+            )
+
+        cursor = conn.execute(
+            "UPDATE tasks SET model_override = ?, provider_override = ? "
+            "WHERE id = ? AND assignee = ? "
+            "AND model_override IS ? AND provider_override IS ? "
+            "AND current_run_id IS NULL AND status != 'archived'",
+            (
+                model, provider, task_id, actor,
+                expected_model, expected_provider,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"model override CAS lost for {task_id}")
+        _append_event(
+            conn,
+            task_id,
+            "model_override_cas",
+            {
+                "actor": actor,
+                "old_model": expected_model,
+                "old_provider": expected_provider,
+                "model": model,
+                "provider": provider,
+            },
+        )
+        return "updated"
+
+
 # ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
