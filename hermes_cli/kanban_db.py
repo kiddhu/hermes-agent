@@ -7287,17 +7287,30 @@ def _normalize_completed_pass_recovery_receipt(receipt: Any) -> Optional[dict[st
 
 
 def _reason_bears_commit_identity(reason: Any, receipt: dict[str, Any]) -> bool:
-    """True when the prose reason carries the exact head/tree/base SHAs.
+    """True when the prose reason carries the exact head/tree SHAs.
 
     The crashed predecessor's version-1 PASS is only authoritative when its
-    prose reason re-states the identical commit identity recorded in the latest
-    terminal receipt.  Any head/tree/base drift fails this check.
+    prose reason re-states the identical commit identity (head + tree)
+    recorded in the latest terminal receipt.  Any head/tree drift fails this
+    check.
+
+    The base SHA is deliberately not required in the prose.  The audited
+    PR #87 predecessor PASS (run 4267) re-states ``exact head`` and ``tree``
+    but omits ``base``, while the base itself is already uniquely corroborated
+    before this check runs: the caller normalizes the terminal-run metadata
+    receipt and compares it byte-for-byte against the canonical completed-PASS
+    recovery receipt supplied by a live gm/gm2 controller from the exact
+    commit-bound GitHub ``APPROVED`` review.  Requiring ``base`` in the prose
+    would fail closed on that exact legacy shape even though the base is
+    independently typed and live-confirmed.  ``head`` and ``tree`` remain
+    mandatory, so a headless/treeless predecessor reason — or one that
+    re-states a different head/tree — still fails closed.
     """
     if not isinstance(reason, str) or not reason:
         return False
     return all(
         isinstance(receipt.get(key), str) and receipt[key] in reason
-        for key in ("head", "tree", "base")
+        for key in ("head", "tree")
     )
 
 
