@@ -9336,83 +9336,130 @@ def _canonical_audit_evidence(value: Any) -> Optional[dict[str, Any]]:
     return {key: value[key] for key in sorted(_CANONICAL_AUDIT_EVIDENCE_KEYS)}
 
 
-def _canonical_audit_target_from_handoff_reason(reason: Any) -> Optional[dict[str, Any]]:
-    """Resolve a structured target or the one closed pre-JSON handoff grammar."""
-    if not isinstance(reason, str) or not reason.strip():
-        return None
-    try:
-        target = json.loads(reason)
-    except (TypeError, ValueError):
-        target = None
-    if isinstance(target, dict):
-        candidate = target.get("candidate")
-        summary = target.get("summary")
-        if (
-            set(target) == {"version", "candidate", "summary"}
-            and target.get("version") == 1
-            and isinstance(candidate, dict)
-            and set(candidate) == _CANONICAL_AUDIT_TARGET_KEYS
-            and type(summary) is str
-            and bool(summary.strip())
-        ):
-            return {
-                "version": 1,
-                "candidate": {
-                    key: candidate[key]
-                    for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)
-                },
-                "summary": summary,
-            }
-        return None
+_LEGACY_AUDIT_TARGET_PATTERN = re.compile(
+    r"(?:^|[^\r\n]*?: )PR "
+    r"(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<pr>[1-9][0-9]*) "
+    r"new head (?P<head>[0-9a-fA-F]{40}) "
+    r"\(tree (?P<tree>[0-9a-fA-F]{40}), base (?P<base>[0-9a-fA-F]{7,40})\)\. "
+    r"(?P<summary>[^\r\n]+)"
+)
 
-    # Before structured handoff reasons landed, the author emitted this exact,
-    # receipt-signed sentence grammar.  It is authoritative task-event data,
-    # not a comment/summary inference.  Keep the parser closed and anchored so
-    # arbitrary prose cannot become a candidate binding.
-    match = re.fullmatch(
-        r"[^\r\n]+: PR "
-        r"(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<pr>[1-9][0-9]*) "
-        r"new head (?P<head>[0-9a-fA-F]{40}) "
-        r"\(tree (?P<tree>[0-9a-fA-F]{40}), base (?P<base>[0-9a-fA-F]{7,40})\)\. "
-        r"(?P<summary>[^\r\n]+)",
-        reason,
-    )
-    if match is None:
-        return None
-    return {
-        "version": 1,
-        "candidate": {
+
+def _summary_has_conflicting_audit_target(summary: str, candidate: dict[str, Any]) -> bool:
+    """Reject a second candidate-shaped tuple that conflicts with the binding."""
+    for match in _LEGACY_AUDIT_TARGET_PATTERN.finditer(summary):
+        embedded = {
             "repository": match.group("repository"),
             "pr": int(match.group("pr")),
             "head": match.group("head"),
             "tree": match.group("tree"),
             "base": match.group("base"),
+        }
+        if any(
+            embedded[key] != candidate.get(key)
+            for key in ("repository", "pr", "head", "tree")
+        ) or not str(candidate.get("base", "")).startswith(embedded["base"]):
+            return True
+    return False
+
+
+def _canonical_audit_target_from_handoff_reason(reason: Any) -> Optional[dict[str, Any]]:
+    """Resolve only the strict structured full-tuple handoff target."""
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    try:
+        target = json.loads(reason)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(target, dict):
+        return None
+    candidate = target.get("candidate")
+    summary = target.get("summary")
+    if (
+        set(target) != {"version", "candidate", "summary"}
+        or target.get("version") != 1
+        or not isinstance(candidate, dict)
+        or set(candidate) != _CANONICAL_AUDIT_TARGET_KEYS
+        or type(summary) is not str
+        or not summary.strip()
+        or _summary_has_conflicting_audit_target(summary, candidate)
+    ):
+        return None
+    return {
+        "version": 1,
+        "candidate": {
+            key: candidate[key]
+            for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)
         },
-        "summary": match.group("summary"),
+        "summary": summary,
+    }
+
+
+def _recovery_audit_target_from_handoff_reason(reason: Any) -> Optional[dict[str, Any]]:
+    """Resolve strict JSON or the one recovery-only pre-JSON grammar."""
+    strict = _canonical_audit_target_from_handoff_reason(reason)
+    if strict is not None:
+        return strict
+    if not isinstance(reason, str):
+        return None
+    match = _LEGACY_AUDIT_TARGET_PATTERN.fullmatch(reason)
+    if match is None:
+        return None
+    candidate = {
+        "repository": match.group("repository"),
+        "pr": int(match.group("pr")),
+        "head": match.group("head"),
+        "tree": match.group("tree"),
+        "base": match.group("base"),
+    }
+    summary = match.group("summary")
+    if _summary_has_conflicting_audit_target(summary, candidate):
+        return None
+    return {
+        "version": 1,
+        "candidate": candidate,
+        "summary": summary,
         "legacy_base_prefix": True,
     }
 
 
 def _audit_target_matches_evidence(target: Any, evidence: Any) -> bool:
-    """Match a handoff target to exact evidence, allowing only its legacy base prefix."""
+    """Match only a strict structured full-tuple handoff to exact evidence."""
+    canonical = _canonical_audit_evidence(evidence)
+    return (
+        isinstance(target, dict)
+        and canonical is not None
+        and set(target) == {"version", "candidate", "summary"}
+        and target.get("version") == 1
+        and isinstance(target.get("candidate"), dict)
+        and target["candidate"] == {
+            key: canonical[key] for key in sorted(_CANONICAL_AUDIT_TARGET_KEYS)
+        }
+        and type(target.get("summary")) is str
+        and bool(target["summary"].strip())
+    )
+
+
+def _recovery_audit_target_matches_evidence(target: Any, evidence: Any) -> bool:
+    """Allow the historical base prefix only on completed-run recovery."""
+    if _audit_target_matches_evidence(target, evidence):
+        return True
     canonical = _canonical_audit_evidence(evidence)
     if not isinstance(target, dict) or canonical is None:
         return False
     candidate = target.get("candidate")
-    if (
-        target.get("version") != 1
-        or not isinstance(candidate, dict)
-        or set(candidate) != _CANONICAL_AUDIT_TARGET_KEYS
-        or type(target.get("summary")) is not str
-        or not target["summary"].strip()
-        or any(candidate[key] != canonical[key] for key in ("repository", "pr", "head", "tree"))
-    ):
-        return False
-    if set(target) == {"version", "candidate", "summary"}:
-        return candidate["base"] == canonical["base"]
     return (
         set(target) == {"version", "candidate", "summary", "legacy_base_prefix"}
+        and target.get("version") == 1
         and target.get("legacy_base_prefix") is True
+        and isinstance(candidate, dict)
+        and set(candidate) == _CANONICAL_AUDIT_TARGET_KEYS
+        and type(target.get("summary")) is str
+        and bool(target["summary"].strip())
+        and all(
+            candidate[key] == canonical[key]
+            for key in ("repository", "pr", "head", "tree")
+        )
         and isinstance(candidate["base"], str)
         and 7 <= len(candidate["base"]) <= 40
         and canonical["base"].startswith(candidate["base"])
@@ -9923,12 +9970,12 @@ def _recovered_same_child_reaudit_pass_receipt(
         "SELECT summary FROM task_runs WHERE id=? AND task_id=?",
         (terminal_run_id, auditor_task_id),
     ).fetchone()
-    target = _canonical_audit_target_from_handoff_reason(handoff.reason)
+    target = _recovery_audit_target_from_handoff_reason(handoff.reason)
 
     if (
         summary is None
         or summary["summary"] != recovery["reason"]
-        or not _audit_target_matches_evidence(target, evidence)
+        or not _recovery_audit_target_matches_evidence(target, evidence)
     ):
         return None
 
@@ -10090,7 +10137,7 @@ def _recover_latest_completed_same_child_pass(
             if handoff_row is not None else None
         )
         target = (
-            _canonical_audit_target_from_handoff_reason(handoff.reason)
+            _recovery_audit_target_from_handoff_reason(handoff.reason)
             if handoff is not None else None
         )
 
@@ -10112,7 +10159,7 @@ def _recover_latest_completed_same_child_pass(
             or terminal[1] != FACTORY_REVIEW_AUDITOR_PROFILE
             or _latest_completed_reaudit_pass_evidence(terminal[2]) != normalized
             or handoff is None
-            or not _audit_target_matches_evidence(target, normalized)
+            or not _recovery_audit_target_matches_evidence(target, normalized)
         ):
             return False
         run = conn.execute(

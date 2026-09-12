@@ -40,7 +40,12 @@ def isolated_board(tmp_path, monkeypatch):
         yield
 
 
-def _fixture(conn: sqlite3.Connection, monkeypatch) -> dict:
+def _fixture(
+    conn: sqlite3.Connection,
+    monkeypatch,
+    *,
+    handoff_reason: str = LEGACY_HANDOFF,
+) -> dict:
     author = kb.create_task(conn, title="author", assignee="agent007")
     auditor = kb.create_task(
         conn,
@@ -83,7 +88,7 @@ def _fixture(conn: sqlite3.Connection, monkeypatch) -> dict:
             author,
             expected_run_id=author_run_2.current_run_id,
             review_task_id=auditor,
-            reason=LEGACY_HANDOFF,
+            reason=handoff_reason,
         )
         is not None
     )
@@ -169,6 +174,76 @@ def _author_event_bytes(conn, task_id):
             (task_id,),
         ).fetchall()
     ]
+
+
+def _database_snapshot(conn: sqlite3.Connection) -> list[str]:
+    return list(conn.iterdump())
+
+
+def test_legacy_handoff_cannot_terminalize_ordinary_pass(isolated_board):
+    with kb.connect() as conn:
+        author = kb.create_task(conn, title="author", assignee="agent007")
+        auditor = kb.create_task(
+            conn,
+            title="auditor",
+            assignee="bafuxunan",
+            parents=[author],
+        )
+        author_claim = kb.claim_task(conn, author)
+        assert author_claim is not None
+        assert author_claim.current_run_id is not None
+        assert kb.request_review_handoff(
+            conn,
+            author,
+            expected_run_id=author_claim.current_run_id,
+            review_task_id=auditor,
+            reason=LEGACY_HANDOFF,
+        )
+        audit_claim = kb.claim_task(conn, auditor)
+        assert audit_claim is not None
+        assert audit_claim.current_run_id is not None
+        before = _database_snapshot(conn)
+        assert not kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=auditor,
+            expected_review_run_id=audit_claim.current_run_id,
+            verdict="pass",
+            reason=PASS_REASON,
+            evidence=copy.deepcopy(EVIDENCE),
+        )
+        assert _database_snapshot(conn) == before
+        author_task = kb.get_task(conn, author)
+        audit_task = kb.get_task(conn, auditor)
+        assert author_task is not None and author_task.status == "review"
+        assert audit_task is not None and audit_task.status == "running"
+
+
+def test_conflicting_candidate_in_signed_summary_fails_without_mutation(
+    isolated_board,
+    monkeypatch,
+):
+    conflicting = (
+        "Conflicting target: PR attacker/fork#999 new head "
+        f"{'a' * 40} (tree {'c' * 40}, base {'e' * 40}). Do not accept."
+    )
+    handoff = json.dumps(
+        {
+            "version": 1,
+            "candidate": {
+                key: EVIDENCE[key]
+                for key in ("repository", "pr", "head", "tree", "base")
+            },
+            "summary": conflicting,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with kb.connect() as conn:
+        fixture = _fixture(conn, monkeypatch, handoff_reason=handoff)
+        before = _database_snapshot(conn)
+        assert not _recover(conn, fixture)
+        assert _database_snapshot(conn) == before
 
 
 def test_latest_completed_same_child_pass_recovery_and_replay(
