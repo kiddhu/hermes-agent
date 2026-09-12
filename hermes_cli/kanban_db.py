@@ -8083,6 +8083,7 @@ def _legacy_reused_auditor_final_pass(
     infra_run_states = {
         ("blocked", "blocked"), ("stale", "stale"),
         ("timed_out", "timed_out"), ("spawn_failed", "spawn_failed"),
+        ("crashed", "crashed"),
     }
     if any(
         (run["status"], run["outcome"]) not in infra_run_states

@@ -2619,6 +2619,148 @@ def test_canonical_audit_receipt_authenticates_ordered_reused_current_auditor(
         assert child_task is not None and child_task.status == "ready"
 
 
+def _canonical_reused_current_auditor_chain_with_crashes(
+    conn, *, num_crashes: int = 3,
+):
+    """Reviewed author whose reused auditor crashed mid-round before PASS.
+
+    Mirrors the canonical t_427bbfea shape: the exact auditor child emits
+    request_changes, the author re-arms, and the auditor worker dies
+    (``crashed`` — kernel-side ``detect_crashed_workers``) ``num_crashes``
+    times before finally emitting PASS. The crashed runs are infra-failures,
+    not verdicts, so the legacy reused-auditor validator must tolerate them
+    instead of failing the whole chain closed.
+    """
+    author = kb.create_task(
+        conn, title="author with crashed reused auditor", factory_build_gate=1,
+        assignee="agent007",
+    )
+    reviewer = kb.create_task(
+        conn, title="reused auditor that crashed", factory_build_gate=1,
+        assignee="bafuxunan", parents=[author],
+    )
+    child = kb.create_task(
+        conn, title="downstream product transition", factory_build_gate=1,
+        assignee="gm2", parents=[author],
+    )
+
+    # Round 0: request_changes.
+    first_author_run = _claim_and_run_id(conn, author)
+    first_handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=first_author_run, review_task_id=reviewer,
+        reason="candidate 0",
+    )
+    assert first_handoff is not None
+    first_review_run = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=first_review_run, verdict="request_changes",
+        reason="REQUEST_CHANGES_CANDIDATE_0",
+    )
+
+    # Round 1: author re-arms, auditor crashes num_crashes times, then PASS.
+    latest_author_run = _claim_and_run_id(conn, author)
+    latest_handoff = kb.request_review_handoff(
+        conn, author, expected_run_id=latest_author_run, review_task_id=reviewer,
+        reason="candidate 1",
+    )
+    assert latest_handoff is not None
+
+    # The crashed runs are kernel-written infra-failure rows (profile-bound,
+    # ended, unbound to any verdict). Insert them deterministically as the
+    # ``detect_crashed_workers`` outcome would — no verdict, no mirror event.
+    now = int(time.time())
+    with kb.write_txn(conn):
+        for index in range(num_crashes):
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'bafuxunan', 'crashed', 'crashed', ?, ?)",
+                (reviewer, now + index, now + index + 1),
+            )
+
+    latest_review_run = _claim_and_run_id(conn, reviewer)
+    assert kb.record_review_verdict(
+        conn, author, review_task_id=reviewer,
+        expected_review_run_id=latest_review_run, verdict="pass",
+        reason="PASS_CANDIDATE_1",
+    )
+    assert kb.complete_task(
+        conn, reviewer, expected_run_id=latest_review_run,
+        summary="latest reused-current audit passed after crashes",
+    )
+    return {
+        "author": author, "reviewer": reviewer, "child": child,
+        "first_author_run": first_author_run, "first_handoff": first_handoff,
+        "first_review_run": first_review_run,
+        "latest_author_run": latest_author_run, "latest_handoff": latest_handoff,
+        "latest_review_run": latest_review_run,
+    }
+
+
+def test_canonical_audit_receipt_authenticates_reused_auditor_with_crashed_runs(
+    kanban_home, aion_gov_src,
+):
+    with kb.connect() as conn:
+        chain = _canonical_reused_current_auditor_chain_with_crashes(conn)
+        before = _native_state_snapshot(conn)
+
+        receipt = kb._canonical_audit_receipt(conn, chain["author"])
+
+        assert receipt is not None
+        assert receipt["author_run_id"] == chain["latest_author_run"]
+        assert receipt["auditor_task_id"] == chain["reviewer"]
+        assert receipt["auditor_run_id"] == chain["latest_review_run"]
+        assert receipt["verdict"] == "PASS"
+        assert kb._reviewed_author_finalizer_run_id(
+            conn, chain["author"],
+        ) == chain["latest_author_run"]
+        assert _native_state_snapshot(conn) == before
+        # The authenticated same-task continuation terminalizes the reviewed
+        # author without replacement and wakes its downstream child.
+        assert kb.complete_task(
+            conn, chain["author"], summary="terminalized after auditor crashes",
+        )
+        author_task = kb.get_task(conn, chain["author"])
+        child_task = kb.get_task(conn, chain["child"])
+        assert author_task is not None and author_task.status == "done"
+        assert child_task is not None and child_task.status == "ready"
+
+
+def test_canonical_audit_receipt_crashed_auditor_does_not_forge_pass(
+    kanban_home, aion_gov_src,
+):
+    """A crashed infra-failure is tolerated, but never substitutes for PASS."""
+    with kb.connect() as conn:
+        chain = _canonical_reused_current_auditor_chain_with_crashes(conn)
+        author = chain["author"]
+        # Flip the FINAL verdict from pass to request_changes: the crashed
+        # runs must not rescue the chain — there is still no authenticated
+        # PASS, so the receipt stays unauthenticated and fail-closed.
+        final_verdict = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_verdict' ORDER BY id DESC LIMIT 1",
+            (author,),
+        ).fetchone()
+        payload = json.loads(final_verdict["payload"])
+        payload["verdict"] = "request_changes"
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(payload), final_verdict["id"]),
+        )
+        mirror = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_verdict' AND run_id = ? ORDER BY id DESC LIMIT 1",
+            (chain["reviewer"], payload["review_run_id"]),
+        ).fetchone()
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(payload), mirror["id"]),
+        )
+        assert kb._canonical_audit_receipt(conn, author) is None
+        assert kb._reviewed_author_finalizer_run_id(conn, author) is None
+
+
 @pytest.mark.parametrize(
     "drift",
     [
