@@ -689,6 +689,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit machine-readable JSON result",
     )
 
+    p_resume_author = sub.add_parser(
+        "resume-reviewed-author",
+        help="GM/GM2 recovery: resume a reviewed author whose direct auditor "
+             "child failed closed before a Native verdict",
+    )
+    p_resume_author.add_argument("author_task_id")
+    p_resume_author.add_argument("audit_task_id")
+    p_resume_author.add_argument("review_handoff_event_id", type=int)
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
                            help="Task ids to archive (default mode)")
@@ -1112,6 +1121,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "resume-reviewed-author": _cmd_resume_reviewed_author,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -1179,6 +1189,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule",
     "unblock",
     "promote",
+    "resume-reviewed-author",
     "archive",
     "dispatch",
     "daemon",
@@ -2433,6 +2444,38 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_resume_reviewed_author(args: argparse.Namespace) -> int:
+    author_task_id = args.author_task_id
+    audit_task_id = args.audit_task_id
+    review_handoff_event_id = args.review_handoff_event_id
+    with kb.connect_closing() as conn:
+        try:
+            receipt = kb.resume_reviewed_author(
+                conn,
+                author_task_id=author_task_id,
+                audit_task_id=audit_task_id,
+                review_handoff_event_id=review_handoff_event_id,
+            )
+        except PermissionError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 1
+        if receipt is None:
+            print(
+                "cannot resume reviewed author: missing/stale/forged lineage, "
+                "active identity, existing verdict/recovery, terminal task, or "
+                "unmet direct-child binding",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"Resumed {author_task_id} -> {receipt['author_target_status']}; "
+            f"{audit_task_id} -> todo "
+            f"(recovery event {receipt['event_id']}, "
+            f"sha256 {receipt['receipt_sha256']})"
+        )
+    return 0
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:

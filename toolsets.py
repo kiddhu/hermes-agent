@@ -74,6 +74,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_request_review", "kanban_review_verdict",
+    "kanban_resume_reviewed_author",
     "kanban_comment", "kanban_create", "kanban_link", "kanban_unlink",
     "kanban_unblock", "kanban_archive",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -274,6 +275,7 @@ TOOLSETS = {
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
             "kanban_heartbeat", "kanban_request_review", "kanban_review_verdict",
+            "kanban_resume_reviewed_author",
             "kanban_comment",
             "kanban_create", "kanban_link", "kanban_unlink",
             "kanban_unblock", "kanban_archive",
