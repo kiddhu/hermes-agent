@@ -55,6 +55,26 @@ PR109_PROSE_HANDOFF = (
     "child must issue a fresh commit-bound round-3 verdict."
 )
 
+PR962_CANDIDATE = {
+    "repository": "kiddhu/aion-governance",
+    "pr": 962,
+    "head": "005d93b990f9b67962648ecf7c03d1e5d873dae6",
+    "tree": "0313921167562df87490c31af9fa44f2661bcbd4",
+    "base": "adfccfef42a26df3e1c78fe311d1cae36a036ff2",
+}
+
+PR962_PROSE_HANDOFF = (
+    "ASTRA Gate B ACCEPT is bound to PR962 exact head "
+    "005d93b990f9b67962648ecf7c03d1e5d873dae6 "
+    "(tree 0313921167562df87490c31af9fa44f2661bcbd4, "
+    "base adfccfef42a26df3e1c78fe311d1cae36a036ff2). "
+    "Live OPEN/CLEAN/MERGEABLE readback and 3/3 hosted PASS checks verified "
+    "immediately before handoff; exact audit packet is comment 7290. Fresh "
+    "role-separated bafuxunan audit must independently verify incident binding, "
+    "retirement, ambiguity/foreign-shape fail-closed behavior, and zero mutation "
+    "before any Gate C action."
+)
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -350,6 +370,117 @@ def test_frozen_pr109_incident_matches_unpatched_exact_live_tuple(
             "candidate": PR109_CANDIDATE,
             "summary": "PR109 strict PASS target recovery",
         }
+
+
+def _frozen_pr962_shape(conn, monkeypatch):
+    task_ids = iter(["t_9fd7330a", "t_be1bf698", "t_exact_controller"])
+    monkeypatch.setattr(kb, "_new_task_id", lambda: next(task_ids))
+    conn.execute("DELETE FROM sqlite_sequence WHERE name='task_runs'")
+    conn.execute("INSERT INTO sqlite_sequence(name, seq) VALUES ('task_runs', 4684)")
+    author = kb.create_task(conn, title="author", assignee="agent007")
+    author_claim = kb.claim_task(conn, author, claimer="host:author")
+    assert author_claim is not None and author_claim.current_run_id == 4685
+    child = kb.create_task(
+        conn, title="audit", assignee="bafuxunan", parents=[author]
+    )
+    handoff = kb.request_review_handoff(
+        conn,
+        author,
+        expected_run_id=4685,
+        review_task_id=child,
+        reason=PR962_PROSE_HANDOFF,
+    )
+    assert handoff is not None
+    assert handoff.receipt_sha256 == (
+        "148d46fae8368244a3a4d6f0122e5325788370f43c5a98ba1b81f4c65c3c3c23"
+    )
+    child_claim = kb.claim_task(conn, child, claimer="host:auditor")
+    assert child_claim is not None and child_claim.current_run_id == 4686
+    assert kb.block_task(
+        conn,
+        child,
+        reason="same-child re-promotion requires strict target recovery",
+        kind="dependency",
+        expected_run_id=4686,
+    )
+    controller = kb.create_task(conn, title="GM correction", assignee="gm2")
+    controller_claim = kb.claim_task(conn, controller, claimer="gm2:controller")
+    assert controller_claim is not None
+    return (
+        author,
+        4685,
+        child,
+        4686,
+        handoff,
+        controller,
+        controller_claim.current_run_id,
+    )
+
+
+def test_frozen_pr962_incident_binds_strict_target_and_fresh_pass(
+    kanban_home, monkeypatch,
+):
+    """The preserved run4685 -> run4686 prose handoff gets one strict target."""
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _frozen_pr962_shape(conn, monkeypatch)
+        author, _, child, *_ = shape
+        receipt = _call(
+            conn,
+            shape,
+            exact_candidate=PR962_CANDIDATE,
+            reason="PR962 strict PASS target recovery",
+        )
+        assert receipt is not None
+        assert receipt.strict_handoff_reason is not None
+        assert json.loads(receipt.strict_handoff_reason) == {
+            "version": 1,
+            "candidate": PR962_CANDIDATE,
+            "summary": "PR962 strict PASS target recovery",
+        }
+        claimed = kb.claim_task(conn, child, claimer="host:fresh-auditor")
+        assert claimed is not None and claimed.current_run_id is not None
+        evidence = {
+            **PR962_CANDIDATE,
+            "github_review_id": 5190570082,
+            "github_review_url": (
+                "https://github.com/kiddhu/aion-governance/pull/962"
+                "#pullrequestreview-5190570082"
+            ),
+            "github_review_state": "APPROVED",
+        }
+        assert kb.record_review_verdict(
+            conn,
+            author,
+            review_task_id=child,
+            expected_review_run_id=claimed.current_run_id,
+            verdict="pass",
+            reason="fresh exact-head PASS",
+            evidence=evidence,
+        )
+
+
+@pytest.mark.parametrize("field", ["repository", "pr", "head", "tree", "base"])
+def test_frozen_pr962_incident_rejects_candidate_drift_without_mutation(
+    kanban_home, monkeypatch, field,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "gm2")
+    with kb.connect() as conn:
+        shape = _frozen_pr962_shape(conn, monkeypatch)
+        candidate = dict(PR962_CANDIDATE)
+        candidate[field] = (
+            963 if field == "pr"
+            else "wrong/repo" if field == "repository"
+            else "1" * 40
+        )
+        before = "\n".join(conn.iterdump())
+        assert _call(
+            conn,
+            shape,
+            exact_candidate=candidate,
+            reason="must fail closed",
+        ) is None
+        assert "\n".join(conn.iterdump()) == before
 
 
 @pytest.mark.parametrize("field", ["repository", "pr", "head", "tree", "base"])

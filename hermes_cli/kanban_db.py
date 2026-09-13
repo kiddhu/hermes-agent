@@ -286,6 +286,35 @@ FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT = {
         "child must issue a fresh commit-bound round-3 verdict."
     ),
 }
+# A second immutable pre-JSON incident reached the same blocked-auditor state
+# before the strict target binder was resident.  Keep it exact and closed: this
+# is migration data for one preserved task/run generation, never a prose parser
+# or reusable authority family.
+FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT_PR962 = {
+    "author_task_id": "t_9fd7330a",
+    "author_run_id": 4685,
+    "review_task_id": "t_be1bf698",
+    "prior_review_run_id": 4686,
+    "handoff_receipt_sha256": (
+        "148d46fae8368244a3a4d6f0122e5325788370f43c5a98ba1b81f4c65c3c3c23"
+    ),
+    "repository": "kiddhu/aion-governance",
+    "pr": 962,
+    "head": "005d93b990f9b67962648ecf7c03d1e5d873dae6",
+    "tree": "0313921167562df87490c31af9fa44f2661bcbd4",
+    "base": "adfccfef42a26df3e1c78fe311d1cae36a036ff2",
+    "handoff_reason": (
+        "ASTRA Gate B ACCEPT is bound to PR962 exact head "
+        "005d93b990f9b67962648ecf7c03d1e5d873dae6 "
+        "(tree 0313921167562df87490c31af9fa44f2661bcbd4, "
+        "base adfccfef42a26df3e1c78fe311d1cae36a036ff2). "
+        "Live OPEN/CLEAN/MERGEABLE readback and 3/3 hosted PASS checks verified "
+        "immediately before handoff; exact audit packet is comment 7290. Fresh "
+        "role-separated bafuxunan audit must independently verify incident "
+        "binding, retirement, ambiguity/foreign-shape fail-closed behavior, and "
+        "zero mutation before any Gate C action."
+    ),
+}
 FACTORY_CONTROLLED_NO_PRODUCT_CLOSEOUT_REASON = (
     "MACHINE_CANARY_COMPLETE_NO_PRODUCT_PAYLOAD"
 )
@@ -9705,20 +9734,29 @@ def _repromote_blocked_review_child(
             strict_target is not None
             and strict_target.get("candidate") == exact_candidate
         )
-        # Historical migration only: one immutable PR109 prose handoff may
-        # bootstrap a strict correction. Every identity/run/receipt field is
-        # frozen so this cannot become a future prose authority family.
-        incident = FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT
-        historical_recovery_match = (
+        # Historical migration only: the explicitly enumerated immutable prose
+        # handoffs may bootstrap strict corrections. Every identity/run/receipt
+        # field is frozen so this cannot become a future prose authority family.
+        incidents = (
+            FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT,
+            FACTORY_HISTORICAL_PROSE_REPROMOTION_INCIDENT_PR962,
+        )
+        historical_recovery_match = any(
             author_task_id == incident["author_task_id"]
             and author_run_id == incident["author_run_id"]
             and review_task_id == incident["review_task_id"]
             and prior_review_run_id == incident["prior_review_run_id"]
             and handoff_receipt_sha256 == incident["handoff_receipt_sha256"]
             and handoff.reason == incident["handoff_reason"]
-            and exact_candidate["repository"] == incident["repository"]
-            and exact_candidate["pr"] == incident["pr"]
-            and exact_candidate["base"] == incident["base"]
+            and all(
+                exact_candidate[key] == incident[key]
+                for key in ("repository", "pr", "base")
+            )
+            and all(
+                key not in incident or exact_candidate[key] == incident[key]
+                for key in ("head", "tree")
+            )
+            for incident in incidents
         )
         if not strict_match and not historical_recovery_match:
             return None
