@@ -1645,6 +1645,22 @@ class GatewayKanbanWatchersMixin:
                 spawn_admission_min_free_bytes,
             )
 
+        # R06 A-2 typed cgroup memory starvation PSI threshold (percent;
+        # negative = disabled). None defers to the dispatcher's env-var
+        # bridge/default when the key is absent or unparseable.
+        raw_psi = kanban_cfg.get("cgroup_starvation_psi_threshold")
+        try:
+            cgroup_starvation_psi_threshold = (
+                float(raw_psi) if raw_psi is not None else None
+            )
+        except (TypeError, ValueError):
+            cgroup_starvation_psi_threshold = None
+        if cgroup_starvation_psi_threshold is not None:
+            logger.info(
+                "kanban dispatcher: cgroup_starvation_psi_threshold=%s",
+                cgroup_starvation_psi_threshold,
+            )
+
         # R06-B/C per-worker cgroup isolation + process-level reaping. Resolve
         # the four settings into a dict passed to dispatch_once; each limit is
         # 0 = disabled, and isolation itself is off by default (degrading to
@@ -1770,6 +1786,7 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     lifecycle_request_fn=_evaluate_native_lifecycle_restart_request,
                     spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
+                    cgroup_starvation_psi_threshold=cgroup_starvation_psi_threshold,
                     worker_isolation=worker_isolation,
                 )
             except sqlite3.DatabaseError as exc:

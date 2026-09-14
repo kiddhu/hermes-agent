@@ -2561,6 +2561,20 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         spawn_admission_min_free_bytes = _coerce_nonneg_int(
             _kanban_cfg.get("spawn_admission_min_free_bytes")
         )
+        # R06 A-2 typed cgroup memory starvation PSI threshold (percent;
+        # negative = disabled). None defers to the dispatcher's env-var
+        # bridge/default when the key is absent or unparseable.
+        def _coerce_psi_threshold(value):
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        cgroup_starvation_psi_threshold = _coerce_psi_threshold(
+            _kanban_cfg.get("cgroup_starvation_psi_threshold")
+        )
         # R06-B/C per-worker cgroup isolation + process-level reaping.
         worker_isolation = {
             "enabled": bool(_kanban_cfg.get("worker_isolation_enabled", False)),
@@ -2584,6 +2598,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
         spawn_admission_min_free_bytes = 0
+        cgroup_starvation_psi_threshold = None
         worker_isolation = None
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
@@ -2595,6 +2610,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             spawn_admission_min_free_bytes=spawn_admission_min_free_bytes,
+            cgroup_starvation_psi_threshold=cgroup_starvation_psi_threshold,
             worker_isolation=worker_isolation,
         )
     if getattr(args, "json", False):

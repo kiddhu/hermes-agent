@@ -3070,6 +3070,13 @@ DEFAULT_CONFIG = {
         # disables the gate. Derive from measured worker envelope + baseline,
         # not a gateway-only guess.
         "spawn_admission_min_free_bytes": 0,
+        # R06 A-2 typed cgroup memory starvation gate (AION-790): refuse a new
+        # heavy spawn when the dispatcher's own cgroup ``memory.current`` is at
+        # or above ``memory.high`` AND that same cgroup's memory PSI
+        # ``some avg10`` is at or above this threshold (percent). Emits a typed
+        # RESOURCE_CGROUP_MEMORY_STARVATION fail-closed event instead of an
+        # unbounded WAIT_MACHINE deferral. A negative value disables the gate.
+        "cgroup_starvation_psi_threshold": 50.0,
         # R06-B/C per-worker resource isolation + process-level reaping: when
         # enabled, each spawned worker is moved into its own cgroup v2
         # (hermes-kanban-<task>) so its detached descendants (background procs,
