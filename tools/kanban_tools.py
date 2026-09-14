@@ -935,6 +935,53 @@ def _handle_repromote_review(args: dict, **kw) -> str:
         return tool_error(f"kanban_repromote_review: {e}")
 
 
+def _handle_resume_reviewed_author_amend(args: dict, **kw) -> str:
+    """GM/GM2 resume of one reviewed author after exact terminal evidence."""
+    delegated_err = _reject_delegated_child_mutation(
+        "kanban_resume_reviewed_author_amend"
+    )
+    if delegated_err:
+        return delegated_err
+    controller_task_id = _default_task_id(None)
+    controller_run_id = _worker_run_id(controller_task_id or "")
+    if not controller_task_id or controller_run_id is None:
+        return tool_error("authenticated controller task/run is required")
+    required = (
+        "author_task_id", "author_run_id", "review_task_id", "review_run_id",
+        "review_handoff_event_id", "amend_reason", "amend_receipt_sha256",
+    )
+    missing = [name for name in required if args.get(name) in (None, "")]
+    if missing:
+        return tool_error(f"missing required fields: {', '.join(missing)}")
+    reason = redact_sensitive_text(str(args["amend_reason"]), force=True)
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            receipt = kb.resume_reviewed_author_for_amend(
+                conn,
+                str(args["author_task_id"]),
+                author_run_id=args["author_run_id"],
+                review_task_id=str(args["review_task_id"]),
+                review_run_id=args["review_run_id"],
+                review_handoff_event_id=args["review_handoff_event_id"],
+                amend_reason=reason,
+                amend_receipt_sha256=str(args["amend_receipt_sha256"]),
+                controller_task_id=controller_task_id,
+                controller_run_id=controller_run_id,
+            )
+            if receipt is None:
+                return tool_error(
+                    "AMEND resume refused: controller, exact author/child/latest-run, "
+                    "handoff, terminal evidence, active identity, or replay drifted"
+                )
+            return _ok(**receipt)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_resume_reviewed_author_amend failed")
+        return tool_error(f"kanban_resume_reviewed_author_amend: {e}")
+
+
 def _handle_review_verdict(args: dict, **kw) -> str:
     """Record this auditor child's PASS or REQUEST_CHANGES verdict."""
     delegated_err = _reject_delegated_child_mutation("kanban_review_verdict")
@@ -2115,6 +2162,41 @@ KANBAN_REPROMOTE_REVIEW_SCHEMA = {
 }
 
 
+KANBAN_RESUME_REVIEWED_AUTHOR_AMEND_SCHEMA = {
+    "name": "kanban_resume_reviewed_author_amend",
+    "description": (
+        "GM/GM2-only, versioned SAME-author AMEND transition after an exact "
+        "terminal independent-review generation. Preserves the terminal child, "
+        "lineage, workspace and history; records an immutable controller receipt."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "author_task_id": {"type": "string"},
+            "author_run_id": {"type": "integer"},
+            "review_task_id": {"type": "string"},
+            "review_run_id": {"type": "integer"},
+            "review_handoff_event_id": {"type": "integer"},
+            "amend_reason": {
+                "type": "string",
+                "const": "Core Law Gate B AMEND: PR963 comment 5654208520",
+            },
+            "amend_receipt_sha256": {
+                "type": "string",
+                "const": "070a04c3c9df06d52710cb7a59100774ae8cda2804e1bc3a5d288a02abe9a46f",
+                "description": "SHA-256 of the frozen PR963 Gate-B record body.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [
+            "author_task_id", "author_run_id", "review_task_id", "review_run_id",
+            "review_handoff_event_id", "amend_reason", "amend_receipt_sha256",
+        ],
+        "additionalProperties": False,
+    },
+}
+
+
 KANBAN_REVIEW_VERDICT_SCHEMA = {
     "name": "kanban_review_verdict",
     "description": (
@@ -2680,6 +2762,15 @@ registry.register(
     handler=_handle_repromote_review,
     check_fn=_check_kanban_mode,
     emoji="🔁",
+)
+
+registry.register(
+    name="kanban_resume_reviewed_author_amend",
+    toolset="kanban",
+    schema=KANBAN_RESUME_REVIEWED_AUTHOR_AMEND_SCHEMA,
+    handler=_handle_resume_reviewed_author_amend,
+    check_fn=_check_kanban_mode,
+    emoji="↩",
 )
 
 registry.register(
